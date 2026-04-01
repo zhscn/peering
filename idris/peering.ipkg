@@ -1,0 +1,22 @@
+package peering
+
+version = 0.1.0
+
+sourcedir = "src"
+
+modules = Peering.Common
+        , Peering.Types
+        , Peering.ObjectImage
+        , Peering.ImageMachine
+        , Peering.ImageInvariants
+        , Peering.ImageProcess
+        , Peering.ImageProofs
+        , Peering.ImageRefinement
+        , Peering.ImageReplayCheck
+        , ImageMain
+
+main = ImageMain
+
+executable = peering-replay
+
+depends = base
