@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -324,10 +325,7 @@ struct ActingSet {
   osd_id_t primary() const { return osds.empty() ? -1 : osds[0]; }
   int size() const { return static_cast<int>(osds.size()); }
   bool contains(osd_id_t osd) const {
-    for (auto o : osds)
-      if (o == osd)
-        return true;
-    return false;
+    return std::ranges::contains(osds, osd);
   }
 };
 

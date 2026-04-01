@@ -477,7 +477,7 @@ std::set<osd_id_t> PeeringStateMachine::build_probe_set() const {
 void PeeringStateMachine::send_queries(Effects &fx) {
   auto probes = build_probe_set();
   for (osd_id_t osd : probes) {
-    if (peers_responded_.count(osd) == 0 && peers_queried_.count(osd) == 0) {
+    if (!peers_responded_.contains(osd) && !peers_queried_.contains(osd)) {
       fx.push_back(effect::SendQuery{
           .target = osd,
           .pgid = pgid_,
@@ -493,13 +493,13 @@ bool PeeringStateMachine::have_enough_info() const {
   // This includes prior-interval OSDs, matching Ceph's GetInfo
   // which waits for all probed peers (PriorSet::probe).
   for (auto osd : peers_queried_) {
-    if (peers_responded_.count(osd) == 0) {
+    if (!peers_responded_.contains(osd)) {
       return false;
     }
   }
   // Also need all queried acting replicas other than self.
   for (auto osd : acting_.osds) {
-    if (osd >= 0 && osd != whoami_ && peers_responded_.count(osd) == 0) {
+    if (osd >= 0 && osd != whoami_ && !peers_responded_.contains(osd)) {
       return false;
     }
   }
@@ -535,7 +535,7 @@ std::set<osd_id_t> PeeringStateMachine::image_recovery_targets() const {
 }
 
 bool PeeringStateMachine::is_image_recovery_target(osd_id_t peer) const {
-  return image_recovery_targets().count(peer) > 0;
+  return image_recovery_targets().contains(peer);
 }
 
 PeeringStateMachine::InitializeDecision
@@ -599,8 +599,8 @@ PeeringStateMachine::decide_peer_info_received(
 
   // Fix (round 12): Reject replies from OSDs we never probed or that
   // aren't in acting/up/prior sets.
-  if (!peers_queried_.count(e.from) && !acting_.contains(e.from) &&
-      !up_.contains(e.from) && !prior_osds_.count(e.from)) {
+  if (!peers_queried_.contains(e.from) && !acting_.contains(e.from) &&
+      !up_.contains(e.from) && !prior_osds_.contains(e.from)) {
     return decision;
   }
 
@@ -626,7 +626,7 @@ PeeringStateMachine::decide_peer_info_received(
 
   bool enough_info = true;
   for (auto osd : peers_queried_) {
-    if (osd != e.from && peers_responded_.count(osd) == 0) {
+    if (osd != e.from && !peers_responded_.contains(osd)) {
       enough_info = false;
       break;
     }
@@ -634,7 +634,7 @@ PeeringStateMachine::decide_peer_info_received(
   if (enough_info) {
     for (auto osd : acting_.osds) {
       if (osd >= 0 && osd != whoami_ && osd != e.from &&
-          peers_responded_.count(osd) == 0) {
+          !peers_responded_.contains(osd)) {
         enough_info = false;
         break;
       }
@@ -704,7 +704,7 @@ PeeringStateMachine::decide_advance_map(const event::AdvanceMap &e) const {
     if (next_is_primary && is_active()) {
       int available = 0;
       for (auto osd : e.new_acting.osds) {
-        if (osd >= 0 && peer_info_.count(osd))
+        if (osd >= 0 && peer_info_.contains(osd))
           available++;
       }
       if (available < e.new_pool_min_size) {
@@ -829,7 +829,7 @@ PeeringStateMachine::decide_peer_query_timeout(
 
   bool enough_info = true;
   for (auto osd : peers_queried_) {
-    if (osd != e.peer && peers_responded_.count(osd) == 0) {
+    if (osd != e.peer && !peers_responded_.contains(osd)) {
       enough_info = false;
       break;
     }
@@ -837,7 +837,7 @@ PeeringStateMachine::decide_peer_query_timeout(
   if (enough_info) {
     for (auto osd : acting_.osds) {
       if (osd >= 0 && osd != whoami_ && osd != e.peer &&
-          peers_responded_.count(osd) == 0) {
+          !peers_responded_.contains(osd)) {
         enough_info = false;
         break;
       }
@@ -958,7 +958,7 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   // Fix (round 5): If any prior-interval OSD timed out and had the
   // same interval, it might still carry unseen objectwise authority.
   for (osd_id_t osd : timed_out_probes_) {
-    if (prior_osds_.count(osd) && !peer_info_.count(osd)) {
+    if (prior_osds_.contains(osd) && !peer_info_.contains(osd)) {
       decision.kind = ActingDecisionKind::Down;
       decision.reason = "prior-interval probe timed out";
       return decision;
@@ -985,11 +985,11 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
 
   // Prefer peers already fully caught up to the objectwise authority.
   auto add_peer = [&](osd_id_t osd) {
-    if (osd < 0 || in_want.count(osd))
+    if (osd < 0 || in_want.contains(osd))
       return;
     if (static_cast<int>(want_acting.size()) >= pool_size_)
       return;
-    if (!peers.count(osd))
+    if (!peers.contains(osd))
       return;
     want_acting.push_back(osd);
     in_want.insert(osd);
@@ -1119,7 +1119,7 @@ PeeringStateMachine::decide_activation() const {
   // have changed since choose_acting() originally ran.
   int available = 0;
   for (auto osd : acting_.osds) {
-    if (osd >= 0 && peer_info_.count(osd))
+    if (osd >= 0 && peer_info_.contains(osd))
       available++;
   }
   if (available < pool_min_size_) {

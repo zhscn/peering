@@ -17,1280 +17,1586 @@
  *   ./build/cpp/cross_validate --seed 42 --sequences 5 --events 30
  */
 
-#include <cassert>
+#include <algorithm>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <map>
 #include <random>
+#include <ranges>
 #include <set>
 #include <string>
-#include <algorithm>
+#include <string_view>
 #include <vector>
+
+#include <fmt/core.h>
+#include <fmt/ranges.h>
+#include <glaze/glaze.hpp>
 
 #include "peering_state.h"
 
 using namespace vermilion::peering;
+using namespace std::string_view_literals;
 
-static void print_prefixed_auth_source_lines(const char* label,
-                                             const AuthorityImage& auth_sources);
+// ── JSON view types ─────────────────────────────────────────────────
+//
+// Glaze serializes these via C++23 aggregate reflection.
+// View types exist for domain types that need transformation before
+// serialization (ObjectImage→array, PeerInfo→normalized, enum→string).
 
-enum class OutputFormat {
-    Legacy,
-    Jsonl,
+struct ObjImageEntry {
+  uint64_t obj{};
+  uint64_t len{};
 };
 
-static journal_seq_t observed_auth_seq(const std::vector<PeerInfo>& infos) {
-    journal_seq_t seq = 0;
-    for (const auto& raw : infos) {
-        auto info = normalized_peer_info(raw);
-        seq = std::max(seq, info.committed_seq);
-    }
-    return seq;
+struct AuthImageEntry {
+  uint64_t obj{};
+  int32_t osd{};
+  uint64_t len{};
+};
+
+struct PeerInfoView {
+  int32_t osd{};
+  uint64_t committed_seq{};
+  uint64_t committed_length{};
+  std::vector<ObjImageEntry> image;
+  uint32_t last_epoch_started{};
+  uint32_t last_interval_started{};
+};
+
+struct PGInfoView {
+  uint64_t pgid{};
+  uint64_t committed_seq{};
+  uint64_t committed_length{};
+  std::vector<ObjImageEntry> image;
+  uint32_t last_epoch_started{};
+  uint32_t last_interval_started{};
+  uint32_t last_epoch_clean{};
+  uint32_t epoch_created{};
+  uint32_t same_interval_since{};
+  uint32_t same_up_since{};
+  uint32_t same_primary_since{};
+};
+
+struct ObjRecoveryView {
+  uint64_t obj{};
+  int32_t source{};
+  uint64_t from_length{};
+  uint64_t to_length{};
+};
+
+struct PeerRecoveryPlanView {
+  int32_t target{};
+  uint64_t peer_committed_seq{};
+  uint64_t authoritative_seq{};
+  std::vector<ObjRecoveryView> recoveries;
+};
+
+struct SnapshotChecksView {
+  bool have_enough_info{};
+  bool image_invariant{};
+  bool image_clean{};
+  bool image_recovering{};
+};
+
+struct SnapshotView {
+  std::string state;
+  uint64_t pgid{};
+  int32_t whoami{};
+  uint32_t epoch{};
+  ActingSet acting;
+  ActingSet up;
+  int pool_size{};
+  int pool_min_size{};
+  PGInfoView local_info;
+  uint64_t auth_seq{};
+  std::vector<ObjImageEntry> auth_image;
+  std::vector<AuthImageEntry> auth_sources;
+  std::vector<PeerInfoView> peer_info;
+  std::vector<int32_t> peers_queried;
+  std::vector<int32_t> peers_responded;
+  std::vector<int32_t> prior_osds;
+  std::vector<int32_t> recovery_targets;
+  std::vector<PeerRecoveryPlanView> peer_recovery_plans;
+  std::vector<ObjRecoveryView> local_recovery_plan;
+  std::vector<int32_t> recovered;
+  std::vector<int32_t> timed_out_probes;
+  bool need_up_thru{};
+  bool activated{};
+  bool pending_acting_change{};
+  uint32_t last_peering_reset{};
+};
+
+// Event view types (for events with ObjectImage/PeerInfo/PGInfo fields)
+struct InitializeView {
+  std::string type = "Initialize";
+  uint64_t pgid{};
+  int32_t whoami{};
+  uint32_t epoch{};
+  ActingSet acting;
+  ActingSet up;
+  int pool_size{};
+  int pool_min_size{};
+  PGInfoView local_info;
+  std::vector<int32_t> prior_osds;
+};
+
+struct PeerInfoReceivedView {
+  std::string type = "PeerInfoReceived";
+  int32_t from{};
+  PeerInfoView info;
+  uint32_t query_epoch{};
+};
+
+struct ReplicaActivateView {
+  std::string type = "ReplicaActivate";
+  int32_t from{};
+  PeerInfoView auth_info;
+  std::vector<AuthImageEntry> auth_sources;
+  uint64_t authoritative_seq{};
+  uint32_t activation_epoch{};
+};
+
+struct ReplicaRecoveryCompleteView {
+  std::string type = "ReplicaRecoveryComplete";
+  uint64_t new_committed_seq{};
+  uint64_t new_committed_length{};
+  std::vector<ObjImageEntry> recovered_image;
+  uint32_t activation_epoch{};
+};
+
+// Effect view types
+struct SendNotifyView {
+  std::string type = "SendNotify";
+  int32_t target{};
+  uint64_t pgid{};
+  PeerInfoView info;
+  uint32_t epoch{};
+};
+
+struct SendActivateView {
+  std::string type = "SendActivate";
+  int32_t target{};
+  uint64_t pgid{};
+  PeerInfoView auth_info;
+  std::vector<AuthImageEntry> auth_sources;
+  uint64_t authoritative_seq{};
+  uint32_t activation_epoch{};
+};
+
+struct ActivatePGView {
+  std::string type = "ActivatePG";
+  uint64_t pgid{};
+  uint64_t authoritative_seq{};
+  uint64_t authoritative_length{};
+  std::vector<ObjImageEntry> authoritative_image;
+  uint32_t activation_epoch{};
+};
+
+struct ScheduleRecoveryTargetView {
+  int32_t osd{};
+  uint64_t peer_length{};
+  uint64_t authoritative_length{};
+  uint64_t peer_committed_seq{};
+  uint64_t authoritative_seq{};
+  std::vector<ObjRecoveryView> recoveries;
+};
+
+struct ScheduleRecoveryView {
+  std::string type = "ScheduleRecovery";
+  uint64_t pgid{};
+  std::vector<ScheduleRecoveryTargetView> targets;
+};
+
+struct PersistStateView {
+  std::string type = "PersistState";
+  uint64_t pgid{};
+  PGInfoView info;
+};
+
+struct PublishStatsView {
+  std::string type = "PublishStats";
+  uint64_t pgid{};
+  std::string state;
+  uint64_t committed_seq{};
+  uint64_t authoritative_seq{};
+  uint64_t committed_length{};
+  std::vector<ObjImageEntry> image;
+  std::vector<ObjImageEntry> authoritative_image;
+  int acting_size{};
+  int up_size{};
+};
+
+struct LogTransitionView {
+  std::string type = "LogTransition";
+  uint64_t pgid{};
+  std::string from;
+  std::string to;
+  std::string reason;
+};
+
+// Simple event/effect types serialized directly via tagged_json
+struct SendQueryTagged {
+  std::string type = "SendQuery";
+  int32_t target{};
+  uint64_t pgid{};
+  uint32_t epoch{};
+};
+
+struct DeactivatePGTagged {
+  std::string type = "DeactivatePG";
+  uint64_t pgid{};
+};
+
+struct CancelRecoveryTagged {
+  std::string type = "CancelRecovery";
+  uint64_t pgid{};
+};
+
+struct MarkCleanTagged {
+  std::string type = "MarkClean";
+  uint64_t pgid{};
+};
+
+struct RequestUpThruTagged {
+  std::string type = "RequestUpThru";
+  uint32_t epoch{};
+};
+
+struct RequestActingChangeTagged {
+  std::string type = "RequestActingChange";
+  uint64_t pgid{};
+  std::vector<int32_t> want_acting;
+};
+
+struct UpdateHeartbeatsTagged {
+  std::string type = "UpdateHeartbeats";
+  std::vector<int32_t> peers;
+};
+
+struct DeletePGTagged {
+  std::string type = "DeletePG";
+  uint64_t pgid{};
+};
+
+// Simple tagged event views (no complex nested types)
+struct AdvanceMapTagged {
+  std::string type = "AdvanceMap";
+  uint32_t new_epoch{};
+  ActingSet new_acting;
+  ActingSet new_up;
+  int new_pool_size{};
+  int new_pool_min_size{};
+  std::vector<int32_t> prior_osds;
+};
+
+struct PeerQueryTimeoutTagged {
+  std::string type = "PeerQueryTimeout";
+  int32_t peer{};
+};
+
+struct UpThruUpdatedTagged {
+  std::string type = "UpThruUpdated";
+  uint32_t epoch{};
+};
+
+struct ActivateCommittedTagged {
+  std::string type = "ActivateCommitted";
+};
+
+struct RecoveryCompleteTagged {
+  std::string type = "RecoveryComplete";
+  int32_t peer{};
+  uint32_t epoch{};
+};
+
+struct AllReplicasRecoveredTagged {
+  std::string type = "AllReplicasRecovered";
+  uint32_t epoch{};
+  std::vector<int32_t> peers;
+};
+
+struct DeleteStartTagged {
+  std::string type = "DeleteStart";
+};
+
+struct DeleteCompleteTagged {
+  std::string type = "DeleteComplete";
+};
+
+// JSONL wrapper types
+struct SequenceStartJson {
+  std::string kind = "sequence_start";
+  int sequence{};
+  uint64_t seed{};
+};
+
+struct SummaryJson {
+  std::string kind = "summary";
+  uint64_t seed{};
+  int sequences{};
+  int events{};
+};
+
+struct StepJson {
+  std::string kind = "step";
+  int sequence{};
+  int step{};
+  std::string from_state;
+  std::string to_state;
+  glz::raw_json event;
+  glz::raw_json before;
+  glz::raw_json before_checks;
+  glz::raw_json after;
+  glz::raw_json after_checks;
+  glz::raw_json effects;
+};
+
+// ── Conversion helpers ──────────────────────────────────────────────
+
+static auto to_entries(const ObjectImage &img) -> std::vector<ObjImageEntry> {
+  std::vector<ObjImageEntry> v;
+  v.reserve(img.size());
+  for (const auto &[k, val] : img)
+    v.push_back({k, val});
+  return v;
 }
 
-// ── Reuse the PBT event generator ────────────────────────────────────
+static auto to_entries(const AuthorityImage &auth)
+    -> std::vector<AuthImageEntry> {
+  std::vector<AuthImageEntry> v;
+  v.reserve(auth.size());
+  for (const auto &[k, a] : auth)
+    v.push_back({k, a.authority_osd, a.authority_length});
+  return v;
+}
+
+static auto to_vec(const std::set<osd_id_t> &s) -> std::vector<int32_t> {
+  return {s.begin(), s.end()};
+}
+
+static auto to_recovery_view(const ObjRecovery &r) -> ObjRecoveryView {
+  return {r.obj, r.source, r.from_length, r.to_length};
+}
+
+static auto to_recovery_views(const std::vector<ObjRecovery> &rs)
+    -> std::vector<ObjRecoveryView> {
+  std::vector<ObjRecoveryView> v;
+  v.reserve(rs.size());
+  for (const auto &r : rs)
+    v.push_back(to_recovery_view(r));
+  return v;
+}
+
+static auto to_plan_view(const PeerRecoveryPlan &p) -> PeerRecoveryPlanView {
+  return {p.target, p.peer_committed_seq, p.authoritative_seq,
+          to_recovery_views(p.recoveries)};
+}
+
+static auto to_plan_views(const std::vector<PeerRecoveryPlan> &plans)
+    -> std::vector<PeerRecoveryPlanView> {
+  std::vector<PeerRecoveryPlanView> v;
+  v.reserve(plans.size());
+  for (const auto &p : plans)
+    v.push_back(to_plan_view(p));
+  return v;
+}
+
+static auto to_peer_info_view(const PeerInfo &raw) -> PeerInfoView {
+  auto info = normalized_peer_info(raw);
+  return {info.osd,
+          info.committed_seq,
+          info.committed_length,
+          to_entries(effective_image(info)),
+          info.last_epoch_started,
+          info.last_interval_started};
+}
+
+static auto to_pg_info_view(const PGInfo &raw) -> PGInfoView {
+  auto info = normalized_pg_info(raw);
+  return {info.pgid,
+          info.committed_seq,
+          info.committed_length,
+          to_entries(info.image),
+          info.last_epoch_started,
+          info.last_interval_started,
+          info.last_epoch_clean,
+          info.epoch_created,
+          info.same_interval_since,
+          info.same_up_since,
+          info.same_primary_since};
+}
+
+static auto to_peer_info_views(const std::map<osd_id_t, PeerInfo> &infos)
+    -> std::vector<PeerInfoView> {
+  std::vector<PeerInfoView> v;
+  v.reserve(infos.size());
+  for (const auto &[osd, info] : infos) {
+    auto view = to_peer_info_view(info);
+    view.osd = osd;
+    v.push_back(std::move(view));
+  }
+  return v;
+}
+
+// ── Glaze serialization ─────────────────────────────────────────────
+
+template <typename T>
+static auto to_json_str(const T &value) -> std::string {
+  std::string buf;
+  [[maybe_unused]] auto ec = glz::write_json(value, buf);
+  return buf;
+}
+
+// ── Snapshot view conversion ────────────────────────────────────────
+
+static auto to_snapshot_view(const PeeringStateMachine::Snapshot &snap)
+    -> SnapshotView {
+  return {
+      .state = state_name(snap.state),
+      .pgid = snap.pgid,
+      .whoami = snap.whoami,
+      .epoch = snap.epoch,
+      .acting = snap.acting,
+      .up = snap.up,
+      .pool_size = snap.pool_size,
+      .pool_min_size = snap.pool_min_size,
+      .local_info = to_pg_info_view(snap.local_info),
+      .auth_seq = snap.auth_seq,
+      .auth_image = to_entries(snap.auth_image),
+      .auth_sources = to_entries(snap.auth_sources),
+      .peer_info = to_peer_info_views(snap.peer_info),
+      .peers_queried = to_vec(snap.peers_queried),
+      .peers_responded = to_vec(snap.peers_responded),
+      .prior_osds = to_vec(snap.prior_osds),
+      .recovery_targets = to_vec(snap.recovery_targets),
+      .peer_recovery_plans = to_plan_views(snap.peer_recovery_plans),
+      .local_recovery_plan = to_recovery_views(snap.local_recovery_plan),
+      .recovered = to_vec(snap.recovered),
+      .timed_out_probes = to_vec(snap.timed_out_probes),
+      .need_up_thru = snap.need_up_thru,
+      .activated = snap.activated,
+      .pending_acting_change = snap.pending_acting_change,
+      .last_peering_reset = snap.last_peering_reset,
+  };
+}
+
+// ── Event / Effect JSON serialization ───────────────────────────────
+
+template <typename... Ts>
+struct overloaded : Ts... {
+  using Ts::operator()...;
+};
+
+static auto event_to_json(const PeeringEvent &ev) -> std::string {
+  return std::visit(
+      overloaded{
+          [](const event::Initialize &e) {
+            return to_json_str(InitializeView{
+                .type = "Initialize",
+                .pgid = e.pgid,
+                .whoami = e.whoami,
+                .epoch = e.epoch,
+                .acting = e.acting,
+                .up = e.up,
+                .pool_size = e.pool_size,
+                .pool_min_size = e.pool_min_size,
+                .local_info = to_pg_info_view(e.local_info),
+                .prior_osds = {e.prior_osds.begin(), e.prior_osds.end()},
+            });
+          },
+          [](const event::AdvanceMap &e) {
+            return to_json_str(AdvanceMapTagged{
+                .type = "AdvanceMap",
+                .new_epoch = e.new_epoch,
+                .new_acting = e.new_acting,
+                .new_up = e.new_up,
+                .new_pool_size = e.new_pool_size,
+                .new_pool_min_size = e.new_pool_min_size,
+                .prior_osds = {e.prior_osds.begin(), e.prior_osds.end()},
+            });
+          },
+          [](const event::PeerInfoReceived &e) {
+            auto info = normalized_peer_info(e.info);
+            return to_json_str(PeerInfoReceivedView{
+                .type = "PeerInfoReceived",
+                .from = e.from,
+                .info = to_peer_info_view(info),
+                .query_epoch = e.query_epoch,
+            });
+          },
+          [](const event::PeerQueryTimeout &e) {
+            return to_json_str(PeerQueryTimeoutTagged{
+                .type = "PeerQueryTimeout",
+                .peer = e.peer,
+            });
+          },
+          [](const event::UpThruUpdated &e) {
+            return to_json_str(UpThruUpdatedTagged{
+                .type = "UpThruUpdated",
+                .epoch = e.epoch,
+            });
+          },
+          [](const event::ActivateCommitted &) {
+            return to_json_str(
+                ActivateCommittedTagged{.type = "ActivateCommitted"});
+          },
+          [](const event::RecoveryComplete &e) {
+            return to_json_str(RecoveryCompleteTagged{
+                .type = "RecoveryComplete",
+                .peer = e.peer,
+                .epoch = e.epoch,
+            });
+          },
+          [](const event::AllReplicasRecovered &e) {
+            return to_json_str(AllReplicasRecoveredTagged{
+                .type = "AllReplicasRecovered",
+                .epoch = e.epoch,
+                .peers = {e.peers.begin(), e.peers.end()},
+            });
+          },
+          [](const event::ReplicaActivate &e) {
+            return to_json_str(ReplicaActivateView{
+                .type = "ReplicaActivate",
+                .from = e.from,
+                .auth_info = to_peer_info_view(e.auth_info),
+                .auth_sources = to_entries(e.auth_sources),
+                .authoritative_seq = e.authoritative_seq,
+                .activation_epoch = e.activation_epoch,
+            });
+          },
+          [](const event::ReplicaRecoveryComplete &e) {
+            return to_json_str(ReplicaRecoveryCompleteView{
+                .type = "ReplicaRecoveryComplete",
+                .new_committed_seq = e.new_committed_seq,
+                .new_committed_length = e.new_committed_length,
+                .recovered_image = to_entries(e.recovered_image),
+                .activation_epoch = e.activation_epoch,
+            });
+          },
+          [](const event::DeleteStart &) {
+            return to_json_str(DeleteStartTagged{.type = "DeleteStart"});
+          },
+          [](const event::DeleteComplete &) {
+            return to_json_str(DeleteCompleteTagged{.type = "DeleteComplete"});
+          },
+      },
+      ev);
+}
+
+static auto effect_to_json(const PeeringEffect &fx) -> std::string {
+  return std::visit(
+      overloaded{
+          [](const effect::SendQuery &f) {
+            return to_json_str(SendQueryTagged{
+                .type = "SendQuery",
+                .target = f.target,
+                .pgid = f.pgid,
+                .epoch = f.epoch,
+            });
+          },
+          [](const effect::SendNotify &f) {
+            return to_json_str(SendNotifyView{
+                .type = "SendNotify",
+                .target = f.target,
+                .pgid = f.pgid,
+                .info = to_peer_info_view(f.info),
+                .epoch = f.epoch,
+            });
+          },
+          [](const effect::SendActivate &f) {
+            return to_json_str(SendActivateView{
+                .type = "SendActivate",
+                .target = f.target,
+                .pgid = f.pgid,
+                .auth_info = to_peer_info_view(f.auth_info),
+                .auth_sources = to_entries(f.auth_sources),
+                .authoritative_seq = f.authoritative_seq,
+                .activation_epoch = f.activation_epoch,
+            });
+          },
+          [](const effect::ActivatePG &f) {
+            return to_json_str(ActivatePGView{
+                .type = "ActivatePG",
+                .pgid = f.pgid,
+                .authoritative_seq = f.authoritative_seq,
+                .authoritative_length = f.authoritative_length,
+                .authoritative_image = to_entries(f.authoritative_image),
+                .activation_epoch = f.activation_epoch,
+            });
+          },
+          [](const effect::DeactivatePG &f) {
+            return to_json_str(
+                DeactivatePGTagged{.type = "DeactivatePG", .pgid = f.pgid});
+          },
+          [](const effect::ScheduleRecovery &f) {
+            std::vector<ScheduleRecoveryTargetView> targets;
+            targets.reserve(f.targets.size());
+            for (const auto &t : f.targets) {
+              targets.push_back({
+                  .osd = t.osd,
+                  .peer_length = t.peer_length,
+                  .authoritative_length = t.authoritative_length,
+                  .peer_committed_seq = t.peer_committed_seq,
+                  .authoritative_seq = t.authoritative_seq,
+                  .recoveries = to_recovery_views(t.recoveries),
+              });
+            }
+            return to_json_str(ScheduleRecoveryView{
+                .type = "ScheduleRecovery",
+                .pgid = f.pgid,
+                .targets = std::move(targets),
+            });
+          },
+          [](const effect::CancelRecovery &f) {
+            return to_json_str(CancelRecoveryTagged{
+                .type = "CancelRecovery", .pgid = f.pgid});
+          },
+          [](const effect::MarkClean &f) {
+            return to_json_str(
+                MarkCleanTagged{.type = "MarkClean", .pgid = f.pgid});
+          },
+          [](const effect::PersistState &f) {
+            return to_json_str(PersistStateView{
+                .type = "PersistState",
+                .pgid = f.pgid,
+                .info = to_pg_info_view(f.info),
+            });
+          },
+          [](const effect::RequestUpThru &f) {
+            return to_json_str(
+                RequestUpThruTagged{.type = "RequestUpThru", .epoch = f.epoch});
+          },
+          [](const effect::RequestActingChange &f) {
+            return to_json_str(RequestActingChangeTagged{
+                .type = "RequestActingChange",
+                .pgid = f.pgid,
+                .want_acting = {f.want_acting.begin(), f.want_acting.end()},
+            });
+          },
+          [](const effect::UpdateHeartbeats &f) {
+            return to_json_str(UpdateHeartbeatsTagged{
+                .type = "UpdateHeartbeats",
+                .peers = {f.peers.begin(), f.peers.end()},
+            });
+          },
+          [](const effect::PublishStats &f) {
+            return to_json_str(PublishStatsView{
+                .type = "PublishStats",
+                .pgid = f.pgid,
+                .state = state_name(f.state),
+                .committed_seq = f.committed_seq,
+                .authoritative_seq = f.authoritative_seq,
+                .committed_length = f.committed_length,
+                .image = to_entries(f.image),
+                .authoritative_image = to_entries(f.authoritative_image),
+                .acting_size = f.acting_size,
+                .up_size = f.up_size,
+            });
+          },
+          [](const effect::DeletePG &f) {
+            return to_json_str(
+                DeletePGTagged{.type = "DeletePG", .pgid = f.pgid});
+          },
+          [](const effect::LogTransition &f) {
+            return to_json_str(LogTransitionView{
+                .type = "LogTransition",
+                .pgid = f.pgid,
+                .from = state_name(f.from),
+                .to = state_name(f.to),
+                .reason = f.reason ? f.reason : "",
+            });
+          },
+      },
+      fx);
+}
+
+static auto effects_to_json(const std::vector<PeeringEffect> &effects)
+    -> std::string {
+  std::string buf = "[";
+  for (size_t i = 0; i < effects.size(); ++i) {
+    if (i > 0)
+      buf += ',';
+    buf += effect_to_json(effects[i]);
+  }
+  buf += ']';
+  return buf;
+}
+
+// ── Validation helpers (unchanged logic) ────────────────────────────
+
+static auto observed_auth_seq(const std::vector<PeerInfo> &infos)
+    -> journal_seq_t {
+  journal_seq_t seq = 0;
+  for (const auto &raw : infos) {
+    auto info = normalized_peer_info(raw);
+    seq = std::max(seq, info.committed_seq);
+  }
+  return seq;
+}
+
+static auto known_peer_images(const PeeringStateMachine::Snapshot &snap)
+    -> std::vector<PeerInfo> {
+  std::vector<PeerInfo> peers;
+  peers.reserve(snap.peer_info.size() + 1);
+  for (const auto &[osd, info] : snap.peer_info) {
+    if (osd == snap.whoami)
+      continue;
+    auto copy = normalized_peer_info(info);
+    copy.osd = osd;
+    peers.push_back(std::move(copy));
+  }
+  auto local = normalized_pg_info(snap.local_info);
+  peers.push_back(PeerInfo{
+      .osd = snap.whoami,
+      .committed_seq = local.committed_seq,
+      .committed_length = local.committed_length,
+      .image = local.image,
+      .last_epoch_started = local.last_epoch_started,
+      .last_interval_started = local.last_interval_started,
+  });
+  return peers;
+}
+
+static auto acting_replica_images(const PeeringStateMachine::Snapshot &snap)
+    -> std::vector<PeerInfo> {
+  std::vector<PeerInfo> peers;
+  for (auto osd : snap.acting.osds) {
+    if (osd < 0 || osd == snap.whoami)
+      continue;
+    auto it = snap.peer_info.find(osd);
+    if (it != snap.peer_info.end()) {
+      auto copy = normalized_peer_info(it->second);
+      copy.osd = osd;
+      peers.push_back(std::move(copy));
+    } else {
+      peers.push_back(PeerInfo{.osd = osd});
+    }
+  }
+  return peers;
+}
+
+static bool
+snapshot_have_enough_info(const PeeringStateMachine::Snapshot &snap) {
+  for (auto osd : snap.peers_queried) {
+    if (!snap.peers_responded.contains(osd))
+      return false;
+  }
+  for (auto osd : snap.acting.osds) {
+    if (osd >= 0 && osd != snap.whoami && !snap.peers_responded.contains(osd))
+      return false;
+  }
+  return true;
+}
+
+static bool
+snapshot_image_invariant(const PeeringStateMachine::Snapshot &snap) {
+  auto known_peers = known_peer_images(snap);
+  auto recomputed_sources = authoritative_sources(known_peers);
+  auto recomputed_image = authority_image_values(recomputed_sources);
+  auto recomputed_seq = observed_auth_seq(known_peers);
+  auto expected_peer_plans = build_peer_recovery_plans(
+      recomputed_sources, recomputed_seq, acting_replica_images(snap));
+  auto expected_local_plan =
+      pg_image_recovery_plan(recomputed_sources, snap.local_info);
+
+  for (const auto &[obj, auth] : snap.auth_sources) {
+    bool backed = std::ranges::any_of(known_peers, [&](const PeerInfo &peer) {
+      return lookup_length(effective_image(peer), obj) == auth.authority_length;
+    });
+    if (!backed)
+      return false;
+  }
+  if (!same_image(snap.auth_image, recomputed_image))
+    return false;
+  if (snap.auth_seq != recomputed_seq)
+    return false;
+  if (!same_image(authority_image_values(snap.auth_sources), recomputed_image))
+    return false;
+  if (snap.local_info.committed_seq > snap.auth_seq)
+    return false;
+  if (!prefix_image(effective_image(snap.local_info), snap.auth_image))
+    return false;
+  for (const auto &peer : acting_replica_images(snap)) {
+    if (peer.committed_seq > snap.auth_seq)
+      return false;
+    if (!prefix_image(effective_image(peer), snap.auth_image))
+      return false;
+  }
+  if (snap.peer_recovery_plans != expected_peer_plans)
+    return false;
+  if (snap.local_recovery_plan != expected_local_plan)
+    return false;
+  return true;
+}
+
+static bool snapshot_image_clean(const PeeringStateMachine::Snapshot &snap) {
+  if (!snapshot_image_invariant(snap))
+    return false;
+  if (!snap.peer_recovery_plans.empty() || !snap.local_recovery_plan.empty())
+    return false;
+  if (snap.local_info.committed_seq < snap.auth_seq ||
+      !same_image(effective_image(snap.local_info), snap.auth_image))
+    return false;
+  for (const auto &peer : acting_replica_images(snap)) {
+    if (peer.committed_seq < snap.auth_seq ||
+        !same_image(effective_image(peer), snap.auth_image))
+      return false;
+  }
+  return true;
+}
+
+static bool
+snapshot_image_recovering(const PeeringStateMachine::Snapshot &snap) {
+  bool peer_seq_lag =
+      std::ranges::any_of(acting_replica_images(snap),
+                          [&](const PeerInfo &p) {
+                            return p.committed_seq < snap.auth_seq;
+                          });
+  return snapshot_image_invariant(snap) && !snapshot_image_clean(snap) &&
+         (!snap.peer_recovery_plans.empty() ||
+          !snap.local_recovery_plan.empty() ||
+          snap.local_info.committed_seq < snap.auth_seq || peer_seq_lag);
+}
+
+static auto to_checks_view(const PeeringStateMachine::Snapshot &snap)
+    -> SnapshotChecksView {
+  return {
+      .have_enough_info = snapshot_have_enough_info(snap),
+      .image_invariant = snapshot_image_invariant(snap),
+      .image_clean = snapshot_image_clean(snap),
+      .image_recovering = snapshot_image_recovering(snap),
+  };
+}
+
+// ── Event generator ─────────────────────────────────────────────────
+
+enum class OutputFormat { Legacy, Jsonl };
 
 struct TestConfig {
-    int num_osds;
-    int pool_size;
-    int pool_min_size;
-    osd_id_t whoami;
-    std::vector<osd_id_t> initial_acting;
-    epoch_t current_epoch;
+  int num_osds;
+  int pool_size;
+  int pool_min_size;
+  osd_id_t whoami;
+  std::vector<osd_id_t> initial_acting;
+  epoch_t current_epoch;
 };
 
 struct EventGenerator {
-    std::mt19937 rng;
-    TestConfig cfg;
+  std::mt19937 rng;
+  TestConfig cfg;
 
-    explicit EventGenerator(uint64_t seed) : rng(seed) {}
+  explicit EventGenerator(uint64_t seed) : rng(seed) {}
 
-    TestConfig gen_config() {
-        TestConfig c;
-        c.num_osds = std::uniform_int_distribution<int>(2, 5)(rng);
-        c.pool_size = std::uniform_int_distribution<int>(2, std::min(c.num_osds, 3))(rng);
-        c.pool_min_size = std::uniform_int_distribution<int>(1, c.pool_size)(rng);
-        c.current_epoch = 10;
-        std::vector<osd_id_t> all_osds;
-        for (int i = 0; i < c.num_osds; i++) all_osds.push_back(i);
-        std::shuffle(all_osds.begin(), all_osds.end(), rng);
-        c.initial_acting.assign(all_osds.begin(),
-                                all_osds.begin() + std::min((int)all_osds.size(), c.pool_size));
-        c.whoami = c.initial_acting[0];
-        return c;
-    }
+  TestConfig gen_config() {
+    TestConfig c;
+    c.num_osds = std::uniform_int_distribution<int>(2, 5)(rng);
+    c.pool_size =
+        std::uniform_int_distribution<int>(2, std::min(c.num_osds, 3))(rng);
+    c.pool_min_size =
+        std::uniform_int_distribution<int>(1, c.pool_size)(rng);
+    c.current_epoch = 10;
+    std::vector<osd_id_t> all_osds;
+    for (int i = 0; i < c.num_osds; i++)
+      all_osds.push_back(i);
+    std::ranges::shuffle(all_osds, rng);
+    c.initial_acting.assign(
+        all_osds.begin(),
+        all_osds.begin() + std::min(static_cast<int>(all_osds.size()),
+                                    c.pool_size));
+    c.whoami = c.initial_acting[0];
+    return c;
+  }
 
-    event::Initialize gen_initialize() {
-        cfg = gen_config();
-        uint64_t local_len = std::uniform_int_distribution<uint64_t>(0, 200)(rng);
-        return event::Initialize{
-            .pgid = 1,
-            .whoami = cfg.whoami,
-            .epoch = cfg.current_epoch,
-            .acting = ActingSet{.osds = cfg.initial_acting, .epoch = cfg.current_epoch},
-            .up = ActingSet{.osds = cfg.initial_acting, .epoch = cfg.current_epoch},
-            .pool_size = cfg.pool_size,
-            .pool_min_size = cfg.pool_min_size,
-            .local_info = PGInfo{
+  event::Initialize gen_initialize() {
+    cfg = gen_config();
+    uint64_t local_len =
+        std::uniform_int_distribution<uint64_t>(0, 200)(rng);
+    return event::Initialize{
+        .pgid = 1,
+        .whoami = cfg.whoami,
+        .epoch = cfg.current_epoch,
+        .acting = ActingSet{.osds = cfg.initial_acting,
+                            .epoch = cfg.current_epoch},
+        .up = ActingSet{.osds = cfg.initial_acting,
+                        .epoch = cfg.current_epoch},
+        .pool_size = cfg.pool_size,
+        .pool_min_size = cfg.pool_min_size,
+        .local_info =
+            PGInfo{
                 .pgid = 1,
                 .committed_seq = local_len,
                 .committed_length = local_len,
                 .last_epoch_started = cfg.current_epoch,
                 .last_interval_started = cfg.current_epoch,
             },
-        };
-    }
+    };
+  }
 
-    osd_id_t random_osd() {
-        return std::uniform_int_distribution<osd_id_t>(0, cfg.num_osds - 1)(rng);
-    }
+  osd_id_t random_osd() {
+    return std::uniform_int_distribution<osd_id_t>(0, cfg.num_osds - 1)(rng);
+  }
 
-    osd_id_t random_peer() {
-        osd_id_t osd;
-        int attempts = 0;
-        do {
-            osd = random_osd();
-            attempts++;
-        } while (osd == cfg.whoami && attempts < 20);
-        return osd;
-    }
+  osd_id_t random_peer() {
+    osd_id_t osd;
+    int attempts = 0;
+    do {
+      osd = random_osd();
+      attempts++;
+    } while (osd == cfg.whoami && attempts < 20);
+    return osd;
+  }
 
-    std::vector<osd_id_t> random_acting_set() {
-        std::vector<osd_id_t> all_osds;
-        for (int i = 0; i < cfg.num_osds; i++) all_osds.push_back(i);
-        std::shuffle(all_osds.begin(), all_osds.end(), rng);
-        int sz = std::uniform_int_distribution<int>(1, std::min(cfg.num_osds, cfg.pool_size))(rng);
-        std::vector<osd_id_t> result(all_osds.begin(), all_osds.begin() + sz);
-        if (std::uniform_int_distribution<int>(0, 4)(rng) < 4) {
-            auto it = std::find(result.begin(), result.end(), cfg.whoami);
-            if (it != result.end()) {
-                std::swap(*it, result[0]);
-            } else {
-                result[0] = cfg.whoami;
-            }
-        }
-        return result;
+  std::vector<osd_id_t> random_acting_set() {
+    std::vector<osd_id_t> all_osds;
+    for (int i = 0; i < cfg.num_osds; i++)
+      all_osds.push_back(i);
+    std::ranges::shuffle(all_osds, rng);
+    int sz = std::uniform_int_distribution<int>(
+        1, std::min(cfg.num_osds, cfg.pool_size))(rng);
+    std::vector<osd_id_t> result(all_osds.begin(), all_osds.begin() + sz);
+    if (std::uniform_int_distribution<int>(0, 4)(rng) < 4) {
+      auto it = std::ranges::find(result, cfg.whoami);
+      if (it != result.end()) {
+        std::swap(*it, result[0]);
+      } else {
+        result[0] = cfg.whoami;
+      }
     }
+    return result;
+  }
 
-    PeeringEvent gen_event(const PeeringStateMachine::Snapshot& snap) {
-        int choice = std::uniform_int_distribution<int>(0, 99)(rng);
-        switch (snap.state) {
-        case State::Initial:
-            return gen_advance_map(snap);
-        case State::GetPeerInfo:
-            if (choice < 50) return gen_peer_info_received(snap);
-            if (choice < 70) return gen_peer_query_timeout(snap);
-            if (choice < 85) return gen_advance_map(snap);
-            return gen_delete_start();
-        case State::WaitUpThru:
-            if (choice < 40) return gen_up_thru_updated(snap);
-            if (choice < 60) return gen_peer_info_received(snap);
-            if (choice < 80) return gen_advance_map(snap);
-            return gen_delete_start();
-        case State::Active:
-            if (choice < 30) return gen_advance_map(snap);
-            if (choice < 50) return event::ActivateCommitted{};
-            if (choice < 65) return gen_all_replicas_recovered(snap);
-            if (choice < 80) return gen_recovery_complete(snap);
-            return gen_delete_start();
-        case State::Recovering:
-            if (choice < 40) return gen_recovery_complete(snap);
-            if (choice < 55) return gen_all_replicas_recovered(snap);
-            if (choice < 75) return gen_advance_map(snap);
-            if (choice < 85) return event::ActivateCommitted{};
-            return gen_delete_start();
-        case State::Clean:
-            if (choice < 50) return gen_advance_map(snap);
-            if (choice < 70) return event::ActivateCommitted{};
-            if (choice < 85) return gen_advance_map(snap);
-            return gen_delete_start();
-        case State::Stray:
-            if (choice < 40) return gen_replica_activate(snap);
-            if (choice < 70) return gen_advance_map(snap);
-            return gen_delete_start();
-        case State::ReplicaActive:
-            if (choice < 30) return gen_replica_recovery_complete(snap);
-            if (choice < 60) return gen_advance_map(snap);
-            if (choice < 80) return gen_replica_activate(snap);
-            return gen_delete_start();
-        case State::Down:
-            if (choice < 40) return gen_peer_info_received(snap);
-            if (choice < 70) return gen_advance_map(snap);
-            if (choice < 85) return gen_peer_query_timeout(snap);
-            return gen_delete_start();
-        case State::Incomplete:
-            if (choice < 40) return gen_peer_info_received(snap);
-            if (choice < 70) return gen_advance_map(snap);
-            return gen_delete_start();
-        case State::Deleting:
-            if (choice < 50) return event::DeleteComplete{};
-            return gen_advance_map(snap);
-        default:
-            return gen_advance_map(snap);
-        }
+  PeeringEvent gen_event(const PeeringStateMachine::Snapshot &snap) {
+    int choice = std::uniform_int_distribution<int>(0, 99)(rng);
+    switch (snap.state) {
+    case State::Initial:
+      return gen_advance_map(snap);
+    case State::GetPeerInfo:
+      if (choice < 50)
+        return gen_peer_info_received(snap);
+      if (choice < 70)
+        return gen_peer_query_timeout(snap);
+      if (choice < 85)
+        return gen_advance_map(snap);
+      return gen_delete_start();
+    case State::WaitUpThru:
+      if (choice < 40)
+        return gen_up_thru_updated(snap);
+      if (choice < 60)
+        return gen_peer_info_received(snap);
+      if (choice < 80)
+        return gen_advance_map(snap);
+      return gen_delete_start();
+    case State::Active:
+      if (choice < 30)
+        return gen_advance_map(snap);
+      if (choice < 50)
+        return event::ActivateCommitted{};
+      if (choice < 65)
+        return gen_all_replicas_recovered(snap);
+      if (choice < 80)
+        return gen_recovery_complete(snap);
+      return gen_delete_start();
+    case State::Recovering:
+      if (choice < 40)
+        return gen_recovery_complete(snap);
+      if (choice < 55)
+        return gen_all_replicas_recovered(snap);
+      if (choice < 75)
+        return gen_advance_map(snap);
+      if (choice < 85)
+        return event::ActivateCommitted{};
+      return gen_delete_start();
+    case State::Clean:
+      if (choice < 50)
+        return gen_advance_map(snap);
+      if (choice < 70)
+        return event::ActivateCommitted{};
+      if (choice < 85)
+        return gen_advance_map(snap);
+      return gen_delete_start();
+    case State::Stray:
+      if (choice < 40)
+        return gen_replica_activate(snap);
+      if (choice < 70)
+        return gen_advance_map(snap);
+      return gen_delete_start();
+    case State::ReplicaActive:
+      if (choice < 30)
+        return gen_replica_recovery_complete(snap);
+      if (choice < 60)
+        return gen_advance_map(snap);
+      if (choice < 80)
+        return gen_replica_activate(snap);
+      return gen_delete_start();
+    case State::Down:
+      if (choice < 40)
+        return gen_peer_info_received(snap);
+      if (choice < 70)
+        return gen_advance_map(snap);
+      if (choice < 85)
+        return gen_peer_query_timeout(snap);
+      return gen_delete_start();
+    case State::Incomplete:
+      if (choice < 40)
+        return gen_peer_info_received(snap);
+      if (choice < 70)
+        return gen_advance_map(snap);
+      return gen_delete_start();
+    case State::Deleting:
+      if (choice < 50)
+        return event::DeleteComplete{};
+      return gen_advance_map(snap);
+    default:
+      return gen_advance_map(snap);
     }
+  }
 
-    event::AdvanceMap gen_advance_map(const PeeringStateMachine::Snapshot& snap) {
-        epoch_t new_epoch = snap.epoch + 1;
-        cfg.current_epoch = new_epoch;
-        bool new_interval = std::uniform_int_distribution<int>(0, 9)(rng) < 4;
-        std::vector<osd_id_t> new_acting_osds;
-        if (new_interval) {
-            new_acting_osds = random_acting_set();
-        } else {
-            new_acting_osds = snap.acting.osds;
-        }
-        int new_pool_size = snap.pool_size;
-        int new_pool_min_size = snap.pool_min_size;
-        if (std::uniform_int_distribution<int>(0, 9)(rng) == 0) {
-            new_pool_min_size = std::uniform_int_distribution<int>(1, new_pool_size)(rng);
-        }
-        std::vector<osd_id_t> prior;
-        if (new_interval && std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
-            int n = std::uniform_int_distribution<int>(1, 2)(rng);
-            for (int i = 0; i < n; i++) prior.push_back(random_osd());
-        }
-        return event::AdvanceMap{
-            .new_epoch = new_epoch,
-            .new_acting = ActingSet{.osds = new_acting_osds, .epoch = new_epoch},
-            .new_up = ActingSet{.osds = new_acting_osds, .epoch = new_epoch},
-            .new_pool_size = new_pool_size,
-            .new_pool_min_size = new_pool_min_size,
-            .prior_osds = prior,
-        };
+  event::AdvanceMap
+  gen_advance_map(const PeeringStateMachine::Snapshot &snap) {
+    epoch_t new_epoch = snap.epoch + 1;
+    cfg.current_epoch = new_epoch;
+    bool new_interval =
+        std::uniform_int_distribution<int>(0, 9)(rng) < 4;
+    auto new_acting_osds =
+        new_interval ? random_acting_set()
+                     : std::vector<osd_id_t>(snap.acting.osds);
+    int new_pool_size = snap.pool_size;
+    int new_pool_min_size = snap.pool_min_size;
+    if (std::uniform_int_distribution<int>(0, 9)(rng) == 0) {
+      new_pool_min_size =
+          std::uniform_int_distribution<int>(1, new_pool_size)(rng);
     }
+    std::vector<osd_id_t> prior;
+    if (new_interval &&
+        std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
+      int n = std::uniform_int_distribution<int>(1, 2)(rng);
+      for (int i = 0; i < n; i++)
+        prior.push_back(random_osd());
+    }
+    return event::AdvanceMap{
+        .new_epoch = new_epoch,
+        .new_acting = ActingSet{.osds = new_acting_osds, .epoch = new_epoch},
+        .new_up = ActingSet{.osds = new_acting_osds, .epoch = new_epoch},
+        .new_pool_size = new_pool_size,
+        .new_pool_min_size = new_pool_min_size,
+        .prior_osds = prior,
+    };
+  }
 
-    event::PeerInfoReceived gen_peer_info_received(const PeeringStateMachine::Snapshot& snap) {
-        osd_id_t from = random_peer();
-        uint64_t len = std::uniform_int_distribution<uint64_t>(0, 300)(rng);
-        epoch_t les = std::uniform_int_distribution<epoch_t>(
-            snap.epoch > 5 ? snap.epoch - 5 : 1, snap.epoch)(rng);
-        epoch_t qe = snap.last_peering_reset;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            qe = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
-        }
-        return event::PeerInfoReceived{
-            .from = from,
-            .info = PeerInfo{
+  event::PeerInfoReceived
+  gen_peer_info_received(const PeeringStateMachine::Snapshot &snap) {
+    osd_id_t from = random_peer();
+    uint64_t len = std::uniform_int_distribution<uint64_t>(0, 300)(rng);
+    epoch_t les = std::uniform_int_distribution<epoch_t>(
+        snap.epoch > 5 ? snap.epoch - 5 : 1, snap.epoch)(rng);
+    epoch_t qe = snap.last_peering_reset;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      qe = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
+    }
+    return event::PeerInfoReceived{
+        .from = from,
+        .info =
+            PeerInfo{
                 .osd = from,
                 .committed_seq = len,
                 .committed_length = len,
                 .image = primary_image(len),
                 .last_epoch_started = les,
             },
-            .query_epoch = qe,
-        };
+        .query_epoch = qe,
+    };
+  }
+
+  event::PeerQueryTimeout
+  gen_peer_query_timeout(const PeeringStateMachine::Snapshot &) {
+    return event::PeerQueryTimeout{.peer = random_peer()};
+  }
+
+  event::UpThruUpdated
+  gen_up_thru_updated(const PeeringStateMachine::Snapshot &snap) {
+    epoch_t ep = snap.epoch;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
     }
+    return event::UpThruUpdated{.epoch = ep};
+  }
 
-    event::PeerQueryTimeout gen_peer_query_timeout(const PeeringStateMachine::Snapshot&) {
-        return event::PeerQueryTimeout{.peer = random_peer()};
+  event::RecoveryComplete
+  gen_recovery_complete(const PeeringStateMachine::Snapshot &snap) {
+    osd_id_t peer;
+    if (!snap.recovery_targets.empty() &&
+        std::uniform_int_distribution<int>(0, 2)(rng) < 2) {
+      auto it = snap.recovery_targets.begin();
+      std::advance(
+          it, std::uniform_int_distribution<int>(
+                  0, static_cast<int>(snap.recovery_targets.size()) - 1)(rng));
+      peer = *it;
+    } else {
+      peer = random_peer();
     }
-
-    event::UpThruUpdated gen_up_thru_updated(const PeeringStateMachine::Snapshot& snap) {
-        epoch_t ep = snap.epoch;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
-        }
-        return event::UpThruUpdated{.epoch = ep};
+    epoch_t ep = snap.last_peering_reset;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      ep = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
     }
+    return event::RecoveryComplete{.peer = peer, .epoch = ep};
+  }
 
-    event::RecoveryComplete gen_recovery_complete(const PeeringStateMachine::Snapshot& snap) {
-        osd_id_t peer;
-        if (!snap.recovery_targets.empty() && std::uniform_int_distribution<int>(0, 2)(rng) < 2) {
-            auto it = snap.recovery_targets.begin();
-            std::advance(it, std::uniform_int_distribution<int>(
-                0, (int)snap.recovery_targets.size() - 1)(rng));
-            peer = *it;
-        } else {
-            peer = random_peer();
-        }
-        epoch_t ep = snap.last_peering_reset;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            ep = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
-        }
-        return event::RecoveryComplete{.peer = peer, .epoch = ep};
+  event::AllReplicasRecovered
+  gen_all_replicas_recovered(const PeeringStateMachine::Snapshot &snap) {
+    epoch_t ep = snap.last_peering_reset;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      ep = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
     }
-
-    event::AllReplicasRecovered gen_all_replicas_recovered(const PeeringStateMachine::Snapshot& snap) {
-        epoch_t ep = snap.last_peering_reset;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            ep = snap.last_peering_reset > 1 ? snap.last_peering_reset - 1 : 0;
-        }
-
-        std::vector<osd_id_t> peers;
-        for (osd_id_t peer : snap.recovery_targets) {
-            if (snap.recovered.count(peer) == 0) {
-                peers.push_back(peer);
-            }
-        }
-
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            if (!peers.empty()) {
-                peers.pop_back();
-            } else {
-                peers.push_back(random_peer());
-            }
-        }
-
-        return event::AllReplicasRecovered{
-            .epoch = ep,
-            .peers = std::move(peers),
-        };
+    std::vector<osd_id_t> peers;
+    for (osd_id_t peer : snap.recovery_targets) {
+      if (!snap.recovered.contains(peer))
+        peers.push_back(peer);
     }
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      if (!peers.empty()) {
+        peers.pop_back();
+      } else {
+        peers.push_back(random_peer());
+      }
+    }
+    return event::AllReplicasRecovered{
+        .epoch = ep,
+        .peers = std::move(peers),
+    };
+  }
 
-    event::ReplicaActivate gen_replica_activate(const PeeringStateMachine::Snapshot& snap) {
-        osd_id_t from = snap.acting.primary();
-        if (from < 0) from = random_peer();
-        uint64_t len = std::uniform_int_distribution<uint64_t>(50, 300)(rng);
-        epoch_t ep = snap.epoch;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
-        }
-        return event::ReplicaActivate{
-            .from = from,
-            .auth_info = PeerInfo{
+  event::ReplicaActivate
+  gen_replica_activate(const PeeringStateMachine::Snapshot &snap) {
+    osd_id_t from = snap.acting.primary();
+    if (from < 0)
+      from = random_peer();
+    uint64_t len = std::uniform_int_distribution<uint64_t>(50, 300)(rng);
+    epoch_t ep = snap.epoch;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
+    }
+    return event::ReplicaActivate{
+        .from = from,
+        .auth_info =
+            PeerInfo{
                 .osd = from,
-                .committed_seq = snap.auth_seq > 0 ? snap.auth_seq : len,
+                .committed_seq =
+                    snap.auth_seq > 0 ? snap.auth_seq : len,
                 .committed_length = len,
-                .image = snap.auth_image.empty() ? primary_image(len) : snap.auth_image,
+                .image = snap.auth_image.empty() ? primary_image(len)
+                                                 : snap.auth_image,
                 .last_epoch_started = ep,
             },
-            .auth_sources = snap.auth_sources,
-            .authoritative_seq = snap.auth_seq > 0 ? snap.auth_seq : len,
-            .activation_epoch = ep,
-        };
-    }
+        .auth_sources = snap.auth_sources,
+        .authoritative_seq = snap.auth_seq > 0 ? snap.auth_seq : len,
+        .activation_epoch = ep,
+    };
+  }
 
-    event::ReplicaRecoveryComplete gen_replica_recovery_complete(const PeeringStateMachine::Snapshot& snap) {
-        uint64_t len = snap.auth_length;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            len = std::uniform_int_distribution<uint64_t>(0, 300)(rng);
-        }
-        journal_seq_t seq = snap.auth_seq > 0 ? snap.auth_seq : len;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            seq = std::uniform_int_distribution<journal_seq_t>(0, 300)(rng);
-        }
-        epoch_t ep = snap.epoch;
-        if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
-            ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
-        }
-        return event::ReplicaRecoveryComplete{
-            .new_committed_seq = seq,
-            .new_committed_length = len,
-            .recovered_image = snap.auth_image.empty() ? primary_image(len) : snap.auth_image,
-            .activation_epoch = ep,
-        };
+  event::ReplicaRecoveryComplete gen_replica_recovery_complete(
+      const PeeringStateMachine::Snapshot &snap) {
+    uint64_t len = snap.auth_length;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      len = std::uniform_int_distribution<uint64_t>(0, 300)(rng);
     }
+    journal_seq_t seq = snap.auth_seq > 0 ? snap.auth_seq : len;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      seq = std::uniform_int_distribution<journal_seq_t>(0, 300)(rng);
+    }
+    epoch_t ep = snap.epoch;
+    if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
+      ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
+    }
+    return event::ReplicaRecoveryComplete{
+        .new_committed_seq = seq,
+        .new_committed_length = len,
+        .recovered_image = snap.auth_image.empty() ? primary_image(len)
+                                                   : snap.auth_image,
+        .activation_epoch = ep,
+    };
+  }
 
-    event::DeleteStart gen_delete_start() {
-        return event::DeleteStart{};
-    }
+  event::DeleteStart gen_delete_start() { return event::DeleteStart{}; }
 };
 
-// ── Output helpers ───────────────────────────────────────────────────
+// ── Legacy output helpers ───────────────────────────────────────────
 
-static void print_object_image(const ObjectImage& image) {
-    if (image.empty()) {
-        return;
-    }
-    bool first = true;
-    for (const auto& [obj, len] : image) {
-        if (!first) printf(" ");
-        printf("%lu:%lu", (unsigned long)obj, (unsigned long)len);
-        first = false;
-    }
+static void print_object_image(const ObjectImage &image) {
+  if (image.empty())
+    return;
+  bool first = true;
+  for (const auto &[obj, len] : image) {
+    if (!first)
+      fmt::print(" ");
+    fmt::print("{}:{}", obj, len);
+    first = false;
+  }
 }
 
-static void print_osd_list(const char* label, const std::vector<osd_id_t>& osds) {
-    printf("%s", label);
-    for (size_t i = 0; i < osds.size(); i++) {
-        if (i > 0) printf(" ");
-        printf("%d", osds[i]);
-    }
-    printf("\n");
+static void print_osd_list(std::string_view label,
+                           const std::vector<osd_id_t> &osds) {
+  fmt::print("{}", label);
+  fmt::print("{}", fmt::join(osds, " "));
+  fmt::print("\n");
 }
 
-static std::vector<PeerInfo> known_peer_images(const PeeringStateMachine::Snapshot& snap) {
-    std::vector<PeerInfo> peers;
-    peers.reserve(snap.peer_info.size() + 1);
-    for (const auto& [osd, info] : snap.peer_info) {
-        if (osd == snap.whoami) {
-            continue;
-        }
-        auto copy = normalized_peer_info(info);
-        copy.osd = osd;
-        peers.push_back(std::move(copy));
-    }
-    auto local = normalized_pg_info(snap.local_info);
-    peers.push_back(PeerInfo{
-        .osd = snap.whoami,
-        .committed_seq = local.committed_seq,
-        .committed_length = local.committed_length,
-        .image = local.image,
-        .last_epoch_started = local.last_epoch_started,
-        .last_interval_started = local.last_interval_started,
-    });
-    return peers;
+static void print_osd_vector(const std::vector<osd_id_t> &osds) {
+  fmt::print("{}", fmt::join(osds, " "));
 }
 
-static std::vector<PeerInfo> acting_replica_images(const PeeringStateMachine::Snapshot& snap) {
-    std::vector<PeerInfo> peers;
-    for (auto osd : snap.acting.osds) {
-        if (osd < 0 || osd == snap.whoami) {
-            continue;
-        }
-        auto it = snap.peer_info.find(osd);
-        if (it != snap.peer_info.end()) {
-            auto copy = normalized_peer_info(it->second);
-            copy.osd = osd;
-            peers.push_back(std::move(copy));
-        } else {
-            peers.push_back(PeerInfo{
-                .osd = osd,
-                .committed_seq = 0,
-                .committed_length = 0,
-                .image = {},
-                .last_epoch_started = 0,
-                .last_interval_started = 0,
-            });
-        }
-    }
-    return peers;
+static void print_osd_set(const std::set<osd_id_t> &osds) {
+  bool first = true;
+  for (auto osd : osds) {
+    if (!first)
+      fmt::print(" ");
+    fmt::print("{}", osd);
+    first = false;
+  }
 }
 
-static bool snapshot_have_enough_info(const PeeringStateMachine::Snapshot& snap) {
-    for (auto osd : snap.peers_queried) {
-        if (snap.peers_responded.count(osd) == 0) {
-            return false;
-        }
-    }
-    for (auto osd : snap.acting.osds) {
-        if (osd >= 0 && osd != snap.whoami && snap.peers_responded.count(osd) == 0) {
-            return false;
-        }
-    }
-    return true;
+static void print_prefixed_auth_source_lines(std::string_view label,
+                                             const AuthorityImage &auth) {
+  for (const auto &[obj, item] : auth) {
+    fmt::print("{} {} {} {}\n", label, obj, item.authority_osd,
+               item.authority_length);
+  }
 }
 
-static bool snapshot_image_invariant(const PeeringStateMachine::Snapshot& snap) {
-    auto known_peers = known_peer_images(snap);
-    auto recomputed_sources = authoritative_sources(known_peers);
-    auto recomputed_image = authority_image_values(recomputed_sources);
-    auto recomputed_seq = observed_auth_seq(known_peers);
-    auto expected_peer_plans =
-        build_peer_recovery_plans(recomputed_sources, recomputed_seq, acting_replica_images(snap));
-    auto expected_local_plan = pg_image_recovery_plan(recomputed_sources, snap.local_info);
-    bool backed_by_known = true;
-    for (const auto& [obj, auth] : snap.auth_sources) {
-        bool backed = false;
-        for (const auto& peer : known_peers) {
-            if (lookup_length(effective_image(peer), obj) == auth.authority_length) {
-                backed = true;
-                break;
-            }
-        }
-        if (!backed) {
-            backed_by_known = false;
-            break;
-        }
-    }
-    if (!same_image(snap.auth_image, recomputed_image)) {
-        return false;
-    }
-    if (snap.auth_seq != recomputed_seq) {
-        return false;
-    }
-    if (!same_image(authority_image_values(snap.auth_sources), recomputed_image)) {
-        return false;
-    }
-    if (!backed_by_known) {
-        return false;
-    }
-    if (snap.local_info.committed_seq > snap.auth_seq) {
-        return false;
-    }
-    if (!prefix_image(effective_image(snap.local_info), snap.auth_image)) {
-        return false;
-    }
-    for (const auto& peer : acting_replica_images(snap)) {
-        if (peer.committed_seq > snap.auth_seq) {
-            return false;
-        }
-        if (!prefix_image(effective_image(peer), snap.auth_image)) {
-            return false;
-        }
-    }
-    if (!(snap.peer_recovery_plans == expected_peer_plans)) {
-        return false;
-    }
-    if (!(snap.local_recovery_plan == expected_local_plan)) {
-        return false;
-    }
-    return true;
-}
-
-static bool snapshot_image_clean(const PeeringStateMachine::Snapshot& snap) {
-    if (!snapshot_image_invariant(snap)) {
-        return false;
-    }
-    if (!snap.peer_recovery_plans.empty() || !snap.local_recovery_plan.empty()) {
-        return false;
-    }
-    if (snap.local_info.committed_seq < snap.auth_seq
-        || !same_image(effective_image(snap.local_info), snap.auth_image)) {
-        return false;
-    }
-    for (const auto& peer : acting_replica_images(snap)) {
-        if (peer.committed_seq < snap.auth_seq
-            || !same_image(effective_image(peer), snap.auth_image)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool snapshot_image_recovering(const PeeringStateMachine::Snapshot& snap) {
-    bool peer_seq_lag = false;
-    for (const auto& peer : acting_replica_images(snap)) {
-        if (peer.committed_seq < snap.auth_seq) {
-            peer_seq_lag = true;
-            break;
-        }
-    }
-    return snapshot_image_invariant(snap)
-        && !snapshot_image_clean(snap)
-        && (!snap.peer_recovery_plans.empty()
-            || !snap.local_recovery_plan.empty()
-            || snap.local_info.committed_seq < snap.auth_seq
-            || peer_seq_lag);
-}
-
-static void print_event(const PeeringEvent& ev) {
-    std::visit([](const auto& e) {
-        using T = std::decay_t<decltype(e)>;
-
-        if constexpr (std::is_same_v<T, event::Initialize>) {
-            printf("IMAGE_EVENT Initialize\n");
-            printf("pgid %lu\n", (unsigned long)e.pgid);
-            printf("whoami %d\n", e.whoami);
-            printf("epoch %u\n", e.epoch);
+static void print_event(const PeeringEvent &ev) {
+  std::visit(
+      overloaded{
+          [](const event::Initialize &e) {
+            fmt::print("IMAGE_EVENT Initialize\n");
+            fmt::print("pgid {}\n", e.pgid);
+            fmt::print("whoami {}\n", e.whoami);
+            fmt::print("epoch {}\n", e.epoch);
             print_osd_list("acting ", e.acting.osds);
             print_osd_list("up ", e.up.osds);
-            printf("pool_size %d\n", e.pool_size);
-            printf("pool_min_size %d\n", e.pool_min_size);
-            printf("local_image ");
+            fmt::print("pool_size {}\n", e.pool_size);
+            fmt::print("pool_min_size {}\n", e.pool_min_size);
+            fmt::print("local_image ");
             print_object_image(effective_image(e.local_info));
-            printf("\n");
-            printf("local_committed_seq %lu\n", (unsigned long)e.local_info.committed_seq);
-            printf("last_epoch_started %u\n", e.local_info.last_epoch_started);
-            printf("last_interval_started %u\n", e.local_info.last_interval_started);
-            printf("last_epoch_clean %u\n", e.local_info.last_epoch_clean);
+            fmt::print("\n");
+            fmt::print("local_committed_seq {}\n",
+                       e.local_info.committed_seq);
+            fmt::print("last_epoch_started {}\n",
+                       e.local_info.last_epoch_started);
+            fmt::print("last_interval_started {}\n",
+                       e.local_info.last_interval_started);
+            fmt::print("last_epoch_clean {}\n",
+                       e.local_info.last_epoch_clean);
             print_osd_list("prior_osds ", e.prior_osds);
-        }
-        else if constexpr (std::is_same_v<T, event::AdvanceMap>) {
-            printf("IMAGE_EVENT AdvanceMap\n");
-            printf("new_epoch %u\n", e.new_epoch);
+          },
+          [](const event::AdvanceMap &e) {
+            fmt::print("IMAGE_EVENT AdvanceMap\n");
+            fmt::print("new_epoch {}\n", e.new_epoch);
             print_osd_list("new_acting ", e.new_acting.osds);
             print_osd_list("new_up ", e.new_up.osds);
-            printf("new_pool_size %d\n", e.new_pool_size);
-            printf("new_pool_min_size %d\n", e.new_pool_min_size);
+            fmt::print("new_pool_size {}\n", e.new_pool_size);
+            fmt::print("new_pool_min_size {}\n", e.new_pool_min_size);
             print_osd_list("prior_osds ", e.prior_osds);
-        }
-        else if constexpr (std::is_same_v<T, event::PeerInfoReceived>) {
-            printf("IMAGE_EVENT PeerImageReceived\n");
-            printf("from %d\n", e.from);
-            printf("peer_image ");
+          },
+          [](const event::PeerInfoReceived &e) {
+            fmt::print("IMAGE_EVENT PeerImageReceived\n");
+            fmt::print("from {}\n", e.from);
+            fmt::print("peer_image ");
             print_object_image(effective_image(e.info));
-            printf("\n");
-            printf("peer_committed_seq %lu\n", (unsigned long)e.info.committed_seq);
-            printf("last_epoch_started %u\n", e.info.last_epoch_started);
-            printf("query_epoch %u\n", e.query_epoch);
-        }
-        else if constexpr (std::is_same_v<T, event::PeerQueryTimeout>) {
-            printf("IMAGE_EVENT PeerQueryTimeout\n");
-            printf("peer %d\n", e.peer);
-        }
-        else if constexpr (std::is_same_v<T, event::UpThruUpdated>) {
-            printf("IMAGE_EVENT UpThruUpdated\n");
-            printf("epoch %u\n", e.epoch);
-        }
-        else if constexpr (std::is_same_v<T, event::ActivateCommitted>) {
-            printf("IMAGE_EVENT ActivateCommitted\n");
-        }
-        else if constexpr (std::is_same_v<T, event::RecoveryComplete>) {
-            printf("IMAGE_EVENT RecoveryComplete\n");
-            printf("peer %d\n", e.peer);
-            printf("epoch %u\n", e.epoch);
-        }
-        else if constexpr (std::is_same_v<T, event::AllReplicasRecovered>) {
-            printf("IMAGE_EVENT AllReplicasRecovered\n");
-            printf("epoch %u\n", e.epoch);
+            fmt::print("\n");
+            fmt::print("peer_committed_seq {}\n", e.info.committed_seq);
+            fmt::print("last_epoch_started {}\n",
+                       e.info.last_epoch_started);
+            fmt::print("query_epoch {}\n", e.query_epoch);
+          },
+          [](const event::PeerQueryTimeout &e) {
+            fmt::print("IMAGE_EVENT PeerQueryTimeout\n");
+            fmt::print("peer {}\n", e.peer);
+          },
+          [](const event::UpThruUpdated &e) {
+            fmt::print("IMAGE_EVENT UpThruUpdated\n");
+            fmt::print("epoch {}\n", e.epoch);
+          },
+          [](const event::ActivateCommitted &) {
+            fmt::print("IMAGE_EVENT ActivateCommitted\n");
+          },
+          [](const event::RecoveryComplete &e) {
+            fmt::print("IMAGE_EVENT RecoveryComplete\n");
+            fmt::print("peer {}\n", e.peer);
+            fmt::print("epoch {}\n", e.epoch);
+          },
+          [](const event::AllReplicasRecovered &e) {
+            fmt::print("IMAGE_EVENT AllReplicasRecovered\n");
+            fmt::print("epoch {}\n", e.epoch);
             print_osd_list("peers ", e.peers);
-        }
-        else if constexpr (std::is_same_v<T, event::ReplicaActivate>) {
-            printf("IMAGE_EVENT ReplicaActivate\n");
-            printf("from %d\n", e.from);
-            printf("peer_image ");
+          },
+          [](const event::ReplicaActivate &e) {
+            fmt::print("IMAGE_EVENT ReplicaActivate\n");
+            fmt::print("from {}\n", e.from);
+            fmt::print("peer_image ");
             print_object_image(effective_image(e.auth_info));
-            printf("\n");
-            printf("peer_committed_seq %lu\n", (unsigned long)e.auth_info.committed_seq);
-            printf("authoritative_seq %lu\n", (unsigned long)e.authoritative_seq);
-            printf("last_epoch_started %u\n", e.auth_info.last_epoch_started);
-            print_prefixed_auth_source_lines("activation_auth_source", e.auth_sources);
-            printf("activation_epoch %u\n", e.activation_epoch);
-        }
-        else if constexpr (std::is_same_v<T, event::ReplicaRecoveryComplete>) {
-            printf("IMAGE_EVENT ReplicaRecoveryComplete\n");
-            printf("recovered_image ");
+            fmt::print("\n");
+            fmt::print("peer_committed_seq {}\n",
+                       e.auth_info.committed_seq);
+            fmt::print("authoritative_seq {}\n", e.authoritative_seq);
+            fmt::print("last_epoch_started {}\n",
+                       e.auth_info.last_epoch_started);
+            print_prefixed_auth_source_lines("activation_auth_source",
+                                             e.auth_sources);
+            fmt::print("activation_epoch {}\n", e.activation_epoch);
+          },
+          [](const event::ReplicaRecoveryComplete &e) {
+            fmt::print("IMAGE_EVENT ReplicaRecoveryComplete\n");
+            fmt::print("recovered_image ");
             print_object_image(e.recovered_image.empty()
                                    ? primary_image(e.new_committed_length)
                                    : e.recovered_image);
-            printf("\n");
-            printf("new_committed_seq %lu\n", (unsigned long)e.new_committed_seq);
-            printf("activation_epoch %u\n", e.activation_epoch);
-        }
-        else if constexpr (std::is_same_v<T, event::DeleteStart>) {
-            printf("IMAGE_EVENT DeleteStart\n");
-        }
-        else if constexpr (std::is_same_v<T, event::DeleteComplete>) {
-            printf("IMAGE_EVENT DeleteComplete\n");
-        }
-    }, ev);
-    printf("---\n");
+            fmt::print("\n");
+            fmt::print("new_committed_seq {}\n", e.new_committed_seq);
+            fmt::print("activation_epoch {}\n", e.activation_epoch);
+          },
+          [](const event::DeleteStart &) {
+            fmt::print("IMAGE_EVENT DeleteStart\n");
+          },
+          [](const event::DeleteComplete &) {
+            fmt::print("IMAGE_EVENT DeleteComplete\n");
+          },
+      },
+      ev);
+  fmt::print("---\n");
 }
 
-static void print_osd_vector(const std::vector<osd_id_t>& osds) {
-    for (size_t i = 0; i < osds.size(); i++) {
-        if (i) printf(" ");
-        printf("%d", osds[i]);
+static void
+print_peer_image_lines(const std::map<osd_id_t, PeerInfo> &infos) {
+  for (const auto &[osd, info] : infos) {
+    fmt::print("peer_image {} ", osd);
+    print_object_image(effective_image(info));
+    fmt::print(" {}\n", info.last_epoch_started);
+    fmt::print("peer_committed_seq {} {}\n", osd, info.committed_seq);
+  }
+}
+
+static void print_auth_source_lines(const AuthorityImage &auth_sources) {
+  for (const auto &[obj, item] : auth_sources) {
+    fmt::print("auth_source {} {} {}\n", obj, item.authority_osd,
+               item.authority_length);
+  }
+}
+
+static void
+print_peer_recovery_plan_lines(const std::vector<PeerRecoveryPlan> &plans) {
+  for (const auto &plan : plans) {
+    fmt::print("peer_recovery_seq {} {} {}\n", plan.target,
+               plan.peer_committed_seq, plan.authoritative_seq);
+    for (const auto &item : plan.recoveries) {
+      fmt::print("peer_recovery {} {} {} {}\n", plan.target, item.obj,
+                 item.from_length, item.to_length);
+      fmt::print("peer_recovery_source {} {} {}\n", plan.target, item.obj,
+                 item.source);
     }
+  }
 }
 
-static void print_osd_set(const std::set<osd_id_t>& osds) {
-    bool first = true;
-    for (auto osd : osds) {
-        if (!first) printf(" ");
-        printf("%d", osd);
-        first = false;
-    }
+static void
+print_local_recovery_lines(const std::vector<ObjRecovery> &recoveries) {
+  for (const auto &item : recoveries) {
+    fmt::print("local_recovery {} {} {}\n", item.obj, item.from_length,
+               item.to_length);
+    fmt::print("local_recovery_source {} {}\n", item.obj, item.source);
+  }
 }
 
-static void print_peer_image_lines(const std::map<osd_id_t, PeerInfo>& infos) {
-    for (const auto& [osd, info] : infos) {
-        printf("peer_image %d ", osd);
-        print_object_image(effective_image(info));
-        printf(" %u\n", info.last_epoch_started);
-        printf("peer_committed_seq %d %lu\n", osd, (unsigned long)info.committed_seq);
-    }
+static void print_state(const PeeringStateMachine::Snapshot &snap) {
+  fmt::print("IMAGE_CONTEXT\n");
+  fmt::print("pgid {}\n", snap.pgid);
+  fmt::print("whoami {}\n", snap.whoami);
+  fmt::print("epoch {}\n", snap.epoch);
+  fmt::print("acting ");
+  print_osd_vector(snap.acting.osds);
+  fmt::print("\n");
+  fmt::print("acting_epoch {}\n", snap.acting.epoch);
+  fmt::print("up ");
+  print_osd_vector(snap.up.osds);
+  fmt::print("\n");
+  fmt::print("up_epoch {}\n", snap.up.epoch);
+  fmt::print("pool_size {}\n", snap.pool_size);
+  fmt::print("pool_min_size {}\n", snap.pool_min_size);
+  fmt::print("local_committed_seq {}\n", snap.local_info.committed_seq);
+  fmt::print("local_image ");
+  print_object_image(snap.local_info.image);
+  fmt::print("\n");
+  fmt::print("local_last_epoch_started {}\n",
+             snap.local_info.last_epoch_started);
+  fmt::print("local_last_interval_started {}\n",
+             snap.local_info.last_interval_started);
+  fmt::print("local_last_epoch_clean {}\n",
+             snap.local_info.last_epoch_clean);
+  fmt::print("auth_seq {}\n", snap.auth_seq);
+  fmt::print("auth_image ");
+  print_object_image(snap.auth_image);
+  fmt::print("\n");
+  print_auth_source_lines(snap.auth_sources);
+  print_peer_image_lines(snap.peer_info);
+  fmt::print("peers_queried ");
+  print_osd_set(snap.peers_queried);
+  fmt::print("\n");
+  fmt::print("peers_responded ");
+  print_osd_set(snap.peers_responded);
+  fmt::print("\n");
+  fmt::print("prior_osds ");
+  print_osd_set(snap.prior_osds);
+  fmt::print("\n");
+  print_peer_recovery_plan_lines(snap.peer_recovery_plans);
+  print_local_recovery_lines(snap.local_recovery_plan);
+  if (snap.local_info.committed_seq < snap.auth_seq) {
+    fmt::print("local_recovery_seq {} {}\n", snap.local_info.committed_seq,
+               snap.auth_seq);
+  }
+  fmt::print("recovered ");
+  print_osd_set(snap.recovered);
+  fmt::print("\n");
+  fmt::print("timed_out_probes ");
+  print_osd_set(snap.timed_out_probes);
+  fmt::print("\n");
+  fmt::print("need_up_thru {}\n", snap.need_up_thru ? 1 : 0);
+  fmt::print("activated {}\n", snap.activated ? 1 : 0);
+  fmt::print("pending_acting_change {}\n",
+             snap.pending_acting_change ? 1 : 0);
+  fmt::print("last_peering_reset {}\n", snap.last_peering_reset);
+  fmt::print("have_enough_info {}\n",
+             snapshot_have_enough_info(snap) ? 1 : 0);
+  fmt::print("image_invariant {}\n",
+             snapshot_image_invariant(snap) ? 1 : 0);
+  fmt::print("image_clean {}\n", snapshot_image_clean(snap) ? 1 : 0);
+  fmt::print("image_recovering {}\n",
+             snapshot_image_recovering(snap) ? 1 : 0);
+  fmt::print("---\n");
 }
 
-static void print_auth_source_lines(const AuthorityImage& auth_sources) {
-    for (const auto& [obj, item] : auth_sources) {
-        printf("auth_source %lu %d %lu\n",
-               (unsigned long)obj,
-               item.authority_osd,
-               (unsigned long)item.authority_length);
-    }
-}
-
-static void print_prefixed_auth_source_lines(const char* label,
-                                             const AuthorityImage& auth_sources) {
-    for (const auto& [obj, item] : auth_sources) {
-        printf("%s %lu %d %lu\n",
-               label,
-               (unsigned long)obj,
-               item.authority_osd,
-               (unsigned long)item.authority_length);
-    }
-}
-
-static void print_peer_recovery_plan_lines(const std::vector<PeerRecoveryPlan>& plans) {
-    for (const auto& plan : plans) {
-        printf("peer_recovery_seq %d %lu %lu\n",
-               plan.target,
-               (unsigned long)plan.peer_committed_seq,
-               (unsigned long)plan.authoritative_seq);
-        for (const auto& item : plan.recoveries) {
-            printf("peer_recovery %d %lu %lu %lu\n",
-                   plan.target,
-                   (unsigned long)item.obj,
-                   (unsigned long)item.from_length,
-                   (unsigned long)item.to_length);
-            printf("peer_recovery_source %d %lu %d\n",
-                   plan.target,
-                   (unsigned long)item.obj,
-                   item.source);
-        }
-    }
-}
-
-static void print_local_recovery_lines(const std::vector<ObjRecovery>& recoveries) {
-    for (const auto& item : recoveries) {
-        printf("local_recovery %lu %lu %lu\n",
-               (unsigned long)item.obj,
-               (unsigned long)item.from_length,
-               (unsigned long)item.to_length);
-        printf("local_recovery_source %lu %d\n",
-               (unsigned long)item.obj,
-               item.source);
-    }
-}
-
-static void print_state(const PeeringStateMachine::Snapshot& snap) {
-    printf("IMAGE_CONTEXT\n");
-    printf("pgid %lu\n", (unsigned long)snap.pgid);
-    printf("whoami %d\n", snap.whoami);
-    printf("epoch %u\n", snap.epoch);
-    printf("acting ");
-    print_osd_vector(snap.acting.osds);
-    printf("\n");
-    printf("acting_epoch %u\n", snap.acting.epoch);
-    printf("up ");
-    print_osd_vector(snap.up.osds);
-    printf("\n");
-    printf("up_epoch %u\n", snap.up.epoch);
-    printf("pool_size %d\n", snap.pool_size);
-    printf("pool_min_size %d\n", snap.pool_min_size);
-    printf("local_committed_seq %lu\n", (unsigned long)snap.local_info.committed_seq);
-    printf("local_image ");
-    print_object_image(snap.local_info.image);
-    printf("\n");
-    printf("local_last_epoch_started %u\n", snap.local_info.last_epoch_started);
-    printf("local_last_interval_started %u\n", snap.local_info.last_interval_started);
-    printf("local_last_epoch_clean %u\n", snap.local_info.last_epoch_clean);
-    printf("auth_seq %lu\n", (unsigned long)snap.auth_seq);
-    printf("auth_image ");
-    print_object_image(snap.auth_image);
-    printf("\n");
-    print_auth_source_lines(snap.auth_sources);
-    print_peer_image_lines(snap.peer_info);
-    printf("peers_queried ");
-    print_osd_set(snap.peers_queried);
-    printf("\n");
-    printf("peers_responded ");
-    print_osd_set(snap.peers_responded);
-    printf("\n");
-    printf("prior_osds ");
-    print_osd_set(snap.prior_osds);
-    printf("\n");
-    print_peer_recovery_plan_lines(snap.peer_recovery_plans);
-    print_local_recovery_lines(snap.local_recovery_plan);
-    if (snap.local_info.committed_seq < snap.auth_seq) {
-        printf("local_recovery_seq %lu %lu\n",
-               (unsigned long)snap.local_info.committed_seq,
-               (unsigned long)snap.auth_seq);
-    }
-    printf("recovered ");
-    print_osd_set(snap.recovered);
-    printf("\n");
-    printf("timed_out_probes ");
-    print_osd_set(snap.timed_out_probes);
-    printf("\n");
-    printf("need_up_thru %d\n", snap.need_up_thru ? 1 : 0);
-    printf("activated %d\n", snap.activated ? 1 : 0);
-    printf("pending_acting_change %d\n", snap.pending_acting_change ? 1 : 0);
-    printf("last_peering_reset %u\n", snap.last_peering_reset);
-    printf("have_enough_info %d\n", snapshot_have_enough_info(snap) ? 1 : 0);
-    printf("image_invariant %d\n", snapshot_image_invariant(snap) ? 1 : 0);
-    printf("image_clean %d\n", snapshot_image_clean(snap) ? 1 : 0);
-    printf("image_recovering %d\n", snapshot_image_recovering(snap) ? 1 : 0);
-    printf("---\n");
-}
-
-// ── Structured output helpers ───────────────────────────────────────
-
-static std::string json_escape(const std::string& input) {
-    std::string out;
-    out.reserve(input.size());
-    for (unsigned char ch : input) {
-        switch (ch) {
-        case '\\':
-            out += "\\\\";
-            break;
-        case '"':
-            out += "\\\"";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            if (ch < 0x20) {
-                char buf[7];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
-                out += buf;
-            } else {
-                out.push_back(static_cast<char>(ch));
-            }
-            break;
-        }
-    }
-    return out;
-}
-
-static std::string json_string(const std::string& value) {
-    return "\"" + json_escape(value) + "\"";
-}
-
-template <typename T>
-static std::string json_number(T value) {
-    if constexpr (std::is_signed_v<T>) {
-        return std::to_string(static_cast<long long>(value));
-    } else {
-        return std::to_string(static_cast<unsigned long long>(value));
-    }
-}
-
-static std::string json_bool(bool value) {
-    return value ? "true" : "false";
-}
-
-template <typename Range, typename Fn>
-static std::string json_array(const Range& range, Fn fn) {
-    std::string out = "[";
-    bool first = true;
-    for (const auto& item : range) {
-        if (!first) out += ",";
-        first = false;
-        out += fn(item);
-    }
-    out += "]";
-    return out;
-}
-
-static void json_field(std::string& out, bool& first,
-                       const char* key, const std::string& value) {
-    if (!first) out += ",";
-    first = false;
-    out += json_string(key);
-    out += ":";
-    out += value;
-}
-
-static std::string json_object_image(const ObjectImage& image) {
-    return json_array(image, [](const auto& item) {
-        std::string out = "{";
-        bool first = true;
-        json_field(out, first, "obj", json_number(item.first));
-        json_field(out, first, "len", json_number(item.second));
-        out += "}";
-        return out;
-    });
-}
-
-static std::string json_authority_image(const AuthorityImage& auth) {
-    return json_array(auth, [](const auto& item) {
-        std::string out = "{";
-        bool first = true;
-        json_field(out, first, "obj", json_number(item.first));
-        json_field(out, first, "osd", json_number(item.second.authority_osd));
-        json_field(out, first, "len", json_number(item.second.authority_length));
-        out += "}";
-        return out;
-    });
-}
-
-static std::string json_acting_set(const ActingSet& acting) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "osds",
-               json_array(acting.osds, [](osd_id_t osd) { return json_number(osd); }));
-    json_field(out, first, "epoch", json_number(acting.epoch));
-    out += "}";
-    return out;
-}
-
-static std::string json_obj_recovery(const ObjRecovery& item) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "obj", json_number(item.obj));
-    json_field(out, first, "source", json_number(item.source));
-    json_field(out, first, "from_length", json_number(item.from_length));
-    json_field(out, first, "to_length", json_number(item.to_length));
-    out += "}";
-    return out;
-}
-
-static std::string json_peer_recovery_plan(const PeerRecoveryPlan& plan) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "target", json_number(plan.target));
-    json_field(out, first, "peer_committed_seq", json_number(plan.peer_committed_seq));
-    json_field(out, first, "authoritative_seq", json_number(plan.authoritative_seq));
-    json_field(out, first, "recoveries",
-               json_array(plan.recoveries, [](const ObjRecovery& item) {
-                   return json_obj_recovery(item);
-               }));
-    out += "}";
-    return out;
-}
-
-static std::string json_peer_info(const PeerInfo& info) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "osd", json_number(info.osd));
-    json_field(out, first, "committed_seq", json_number(info.committed_seq));
-    json_field(out, first, "committed_length", json_number(info.committed_length));
-    json_field(out, first, "image", json_object_image(effective_image(info)));
-    json_field(out, first, "last_epoch_started", json_number(info.last_epoch_started));
-    json_field(out, first, "last_interval_started", json_number(info.last_interval_started));
-    out += "}";
-    return out;
-}
-
-static std::string json_pg_info(const PGInfo& raw) {
-    auto info = normalized_pg_info(raw);
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "pgid", json_number(info.pgid));
-    json_field(out, first, "committed_seq", json_number(info.committed_seq));
-    json_field(out, first, "committed_length", json_number(info.committed_length));
-    json_field(out, first, "image", json_object_image(info.image));
-    json_field(out, first, "last_epoch_started", json_number(info.last_epoch_started));
-    json_field(out, first, "last_interval_started", json_number(info.last_interval_started));
-    json_field(out, first, "last_epoch_clean", json_number(info.last_epoch_clean));
-    json_field(out, first, "epoch_created", json_number(info.epoch_created));
-    json_field(out, first, "same_interval_since", json_number(info.same_interval_since));
-    json_field(out, first, "same_up_since", json_number(info.same_up_since));
-    json_field(out, first, "same_primary_since", json_number(info.same_primary_since));
-    out += "}";
-    return out;
-}
-
-static std::string json_peer_info_map(const std::map<osd_id_t, PeerInfo>& infos) {
-    return json_array(infos, [](const auto& entry) {
-        auto info = normalized_peer_info(entry.second);
-        info.osd = entry.first;
-        return json_peer_info(info);
-    });
-}
-
-static std::string json_osd_set(const std::set<osd_id_t>& osds) {
-    return json_array(osds, [](osd_id_t osd) { return json_number(osd); });
-}
-
-static std::string json_snapshot_checks(const PeeringStateMachine::Snapshot& snap) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "have_enough_info", json_bool(snapshot_have_enough_info(snap)));
-    json_field(out, first, "image_invariant", json_bool(snapshot_image_invariant(snap)));
-    json_field(out, first, "image_clean", json_bool(snapshot_image_clean(snap)));
-    json_field(out, first, "image_recovering", json_bool(snapshot_image_recovering(snap)));
-    out += "}";
-    return out;
-}
-
-static std::string json_snapshot(const PeeringStateMachine::Snapshot& snap) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "state", json_string(state_name(snap.state)));
-    json_field(out, first, "pgid", json_number(snap.pgid));
-    json_field(out, first, "whoami", json_number(snap.whoami));
-    json_field(out, first, "epoch", json_number(snap.epoch));
-    json_field(out, first, "acting", json_acting_set(snap.acting));
-    json_field(out, first, "up", json_acting_set(snap.up));
-    json_field(out, first, "pool_size", json_number(snap.pool_size));
-    json_field(out, first, "pool_min_size", json_number(snap.pool_min_size));
-    json_field(out, first, "local_info", json_pg_info(snap.local_info));
-    json_field(out, first, "auth_seq", json_number(snap.auth_seq));
-    json_field(out, first, "auth_image", json_object_image(snap.auth_image));
-    json_field(out, first, "auth_sources", json_authority_image(snap.auth_sources));
-    json_field(out, first, "peer_info", json_peer_info_map(snap.peer_info));
-    json_field(out, first, "peers_queried", json_osd_set(snap.peers_queried));
-    json_field(out, first, "peers_responded", json_osd_set(snap.peers_responded));
-    json_field(out, first, "prior_osds", json_osd_set(snap.prior_osds));
-    json_field(out, first, "recovery_targets", json_osd_set(snap.recovery_targets));
-    json_field(out, first, "peer_recovery_plans",
-               json_array(snap.peer_recovery_plans, [](const PeerRecoveryPlan& plan) {
-                   return json_peer_recovery_plan(plan);
-               }));
-    json_field(out, first, "local_recovery_plan",
-               json_array(snap.local_recovery_plan, [](const ObjRecovery& item) {
-                   return json_obj_recovery(item);
-               }));
-    json_field(out, first, "recovered", json_osd_set(snap.recovered));
-    json_field(out, first, "timed_out_probes", json_osd_set(snap.timed_out_probes));
-    json_field(out, first, "need_up_thru", json_bool(snap.need_up_thru));
-    json_field(out, first, "activated", json_bool(snap.activated));
-    json_field(out, first, "pending_acting_change", json_bool(snap.pending_acting_change));
-    json_field(out, first, "last_peering_reset", json_number(snap.last_peering_reset));
-    out += "}";
-    return out;
-}
-
-static std::string json_event(const PeeringEvent& ev) {
-    return std::visit([](const auto& e) -> std::string {
-        using T = std::decay_t<decltype(e)>;
-        std::string out = "{";
-        bool first = true;
-        if constexpr (std::is_same_v<T, event::Initialize>) {
-            json_field(out, first, "type", json_string("Initialize"));
-            json_field(out, first, "pgid", json_number(e.pgid));
-            json_field(out, first, "whoami", json_number(e.whoami));
-            json_field(out, first, "epoch", json_number(e.epoch));
-            json_field(out, first, "acting", json_acting_set(e.acting));
-            json_field(out, first, "up", json_acting_set(e.up));
-            json_field(out, first, "pool_size", json_number(e.pool_size));
-            json_field(out, first, "pool_min_size", json_number(e.pool_min_size));
-            json_field(out, first, "local_info", json_pg_info(e.local_info));
-            json_field(out, first, "prior_osds",
-                       json_array(e.prior_osds, [](osd_id_t osd) { return json_number(osd); }));
-        } else if constexpr (std::is_same_v<T, event::AdvanceMap>) {
-            json_field(out, first, "type", json_string("AdvanceMap"));
-            json_field(out, first, "new_epoch", json_number(e.new_epoch));
-            json_field(out, first, "new_acting", json_acting_set(e.new_acting));
-            json_field(out, first, "new_up", json_acting_set(e.new_up));
-            json_field(out, first, "new_pool_size", json_number(e.new_pool_size));
-            json_field(out, first, "new_pool_min_size", json_number(e.new_pool_min_size));
-            json_field(out, first, "prior_osds",
-                       json_array(e.prior_osds, [](osd_id_t osd) { return json_number(osd); }));
-        } else if constexpr (std::is_same_v<T, event::PeerInfoReceived>) {
-            json_field(out, first, "type", json_string("PeerInfoReceived"));
-            json_field(out, first, "from", json_number(e.from));
-            json_field(out, first, "info", json_peer_info(normalized_peer_info(e.info)));
-            json_field(out, first, "query_epoch", json_number(e.query_epoch));
-        } else if constexpr (std::is_same_v<T, event::PeerQueryTimeout>) {
-            json_field(out, first, "type", json_string("PeerQueryTimeout"));
-            json_field(out, first, "peer", json_number(e.peer));
-        } else if constexpr (std::is_same_v<T, event::UpThruUpdated>) {
-            json_field(out, first, "type", json_string("UpThruUpdated"));
-            json_field(out, first, "epoch", json_number(e.epoch));
-        } else if constexpr (std::is_same_v<T, event::ActivateCommitted>) {
-            json_field(out, first, "type", json_string("ActivateCommitted"));
-        } else if constexpr (std::is_same_v<T, event::RecoveryComplete>) {
-            json_field(out, first, "type", json_string("RecoveryComplete"));
-            json_field(out, first, "peer", json_number(e.peer));
-            json_field(out, first, "epoch", json_number(e.epoch));
-        } else if constexpr (std::is_same_v<T, event::AllReplicasRecovered>) {
-            json_field(out, first, "type", json_string("AllReplicasRecovered"));
-            json_field(out, first, "epoch", json_number(e.epoch));
-            json_field(out, first, "peers",
-                       json_array(e.peers, [](osd_id_t osd) { return json_number(osd); }));
-        } else if constexpr (std::is_same_v<T, event::ReplicaActivate>) {
-            json_field(out, first, "type", json_string("ReplicaActivate"));
-            json_field(out, first, "from", json_number(e.from));
-            json_field(out, first, "auth_info", json_peer_info(normalized_peer_info(e.auth_info)));
-            json_field(out, first, "auth_sources", json_authority_image(e.auth_sources));
-            json_field(out, first, "authoritative_seq", json_number(e.authoritative_seq));
-            json_field(out, first, "activation_epoch", json_number(e.activation_epoch));
-        } else if constexpr (std::is_same_v<T, event::ReplicaRecoveryComplete>) {
-            json_field(out, first, "type", json_string("ReplicaRecoveryComplete"));
-            json_field(out, first, "new_committed_seq", json_number(e.new_committed_seq));
-            json_field(out, first, "new_committed_length", json_number(e.new_committed_length));
-            json_field(out, first, "recovered_image", json_object_image(e.recovered_image));
-            json_field(out, first, "activation_epoch", json_number(e.activation_epoch));
-        } else if constexpr (std::is_same_v<T, event::DeleteStart>) {
-            json_field(out, first, "type", json_string("DeleteStart"));
-        } else if constexpr (std::is_same_v<T, event::DeleteComplete>) {
-            json_field(out, first, "type", json_string("DeleteComplete"));
-        }
-        out += "}";
-        return out;
-    }, ev);
-}
-
-static std::string json_effect(const PeeringEffect& effect) {
-    return std::visit([](const auto& fx) -> std::string {
-        using T = std::decay_t<decltype(fx)>;
-        std::string out = "{";
-        bool first = true;
-        if constexpr (std::is_same_v<T, effect::SendQuery>) {
-            json_field(out, first, "type", json_string("SendQuery"));
-            json_field(out, first, "target", json_number(fx.target));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "epoch", json_number(fx.epoch));
-        } else if constexpr (std::is_same_v<T, effect::SendNotify>) {
-            json_field(out, first, "type", json_string("SendNotify"));
-            json_field(out, first, "target", json_number(fx.target));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "info", json_peer_info(normalized_peer_info(fx.info)));
-            json_field(out, first, "epoch", json_number(fx.epoch));
-        } else if constexpr (std::is_same_v<T, effect::SendActivate>) {
-            json_field(out, first, "type", json_string("SendActivate"));
-            json_field(out, first, "target", json_number(fx.target));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "auth_info", json_peer_info(normalized_peer_info(fx.auth_info)));
-            json_field(out, first, "auth_sources", json_authority_image(fx.auth_sources));
-            json_field(out, first, "authoritative_seq", json_number(fx.authoritative_seq));
-            json_field(out, first, "activation_epoch", json_number(fx.activation_epoch));
-        } else if constexpr (std::is_same_v<T, effect::ActivatePG>) {
-            json_field(out, first, "type", json_string("ActivatePG"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "authoritative_seq", json_number(fx.authoritative_seq));
-            json_field(out, first, "authoritative_length", json_number(fx.authoritative_length));
-            json_field(out, first, "authoritative_image", json_object_image(fx.authoritative_image));
-            json_field(out, first, "activation_epoch", json_number(fx.activation_epoch));
-        } else if constexpr (std::is_same_v<T, effect::DeactivatePG>) {
-            json_field(out, first, "type", json_string("DeactivatePG"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-        } else if constexpr (std::is_same_v<T, effect::ScheduleRecovery>) {
-            json_field(out, first, "type", json_string("ScheduleRecovery"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "targets",
-                       json_array(fx.targets, [](const effect::ScheduleRecovery::Target& target) {
-                           std::string target_json = "{";
-                           bool target_first = true;
-                           json_field(target_json, target_first, "osd", json_number(target.osd));
-                           json_field(target_json, target_first, "peer_length",
-                                      json_number(target.peer_length));
-                           json_field(target_json, target_first, "authoritative_length",
-                                      json_number(target.authoritative_length));
-                           json_field(target_json, target_first, "peer_committed_seq",
-                                      json_number(target.peer_committed_seq));
-                           json_field(target_json, target_first, "authoritative_seq",
-                                      json_number(target.authoritative_seq));
-                           json_field(target_json, target_first, "recoveries",
-                                      json_array(target.recoveries, [](const ObjRecovery& item) {
-                                          return json_obj_recovery(item);
-                                      }));
-                           target_json += "}";
-                           return target_json;
-                       }));
-        } else if constexpr (std::is_same_v<T, effect::CancelRecovery>) {
-            json_field(out, first, "type", json_string("CancelRecovery"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-        } else if constexpr (std::is_same_v<T, effect::MarkClean>) {
-            json_field(out, first, "type", json_string("MarkClean"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-        } else if constexpr (std::is_same_v<T, effect::PersistState>) {
-            json_field(out, first, "type", json_string("PersistState"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "info", json_pg_info(fx.info));
-        } else if constexpr (std::is_same_v<T, effect::RequestUpThru>) {
-            json_field(out, first, "type", json_string("RequestUpThru"));
-            json_field(out, first, "epoch", json_number(fx.epoch));
-        } else if constexpr (std::is_same_v<T, effect::RequestActingChange>) {
-            json_field(out, first, "type", json_string("RequestActingChange"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "want_acting",
-                       json_array(fx.want_acting, [](osd_id_t osd) {
-                           return json_number(osd);
-                       }));
-        } else if constexpr (std::is_same_v<T, effect::UpdateHeartbeats>) {
-            json_field(out, first, "type", json_string("UpdateHeartbeats"));
-            json_field(out, first, "peers",
-                       json_array(fx.peers, [](osd_id_t osd) { return json_number(osd); }));
-        } else if constexpr (std::is_same_v<T, effect::PublishStats>) {
-            json_field(out, first, "type", json_string("PublishStats"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "state", json_string(state_name(fx.state)));
-            json_field(out, first, "committed_seq", json_number(fx.committed_seq));
-            json_field(out, first, "authoritative_seq", json_number(fx.authoritative_seq));
-            json_field(out, first, "committed_length", json_number(fx.committed_length));
-            json_field(out, first, "image", json_object_image(fx.image));
-            json_field(out, first, "authoritative_image", json_object_image(fx.authoritative_image));
-            json_field(out, first, "acting_size", json_number(fx.acting_size));
-            json_field(out, first, "up_size", json_number(fx.up_size));
-        } else if constexpr (std::is_same_v<T, effect::DeletePG>) {
-            json_field(out, first, "type", json_string("DeletePG"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-        } else if constexpr (std::is_same_v<T, effect::LogTransition>) {
-            json_field(out, first, "type", json_string("LogTransition"));
-            json_field(out, first, "pgid", json_number(fx.pgid));
-            json_field(out, first, "from", json_string(state_name(fx.from)));
-            json_field(out, first, "to", json_string(state_name(fx.to)));
-            json_field(out, first, "reason", json_string(fx.reason ? fx.reason : ""));
-        }
-        out += "}";
-        return out;
-    }, effect);
-}
+// ── JSONL output ────────────────────────────────────────────────────
 
 static void emit_jsonl_sequence_start(int sequence_idx, uint64_t seed) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "kind", json_string("sequence_start"));
-    json_field(out, first, "sequence", json_number(sequence_idx));
-    json_field(out, first, "seed", json_number(seed));
-    out += "}";
-    std::puts(out.c_str());
+  fmt::println("{}", to_json_str(SequenceStartJson{
+                         .kind = "sequence_start",
+                         .sequence = sequence_idx,
+                         .seed = seed,
+                     }));
 }
 
-static void emit_jsonl_step(int sequence_idx, int step_idx, const PeeringEvent& event,
-                            const PeeringStateMachine::SnapshotStepResult& result) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "kind", json_string("step"));
-    json_field(out, first, "sequence", json_number(sequence_idx));
-    json_field(out, first, "step", json_number(step_idx));
-    json_field(out, first, "from_state", json_string(state_name(result.from)));
-    json_field(out, first, "to_state", json_string(state_name(result.to)));
-    json_field(out, first, "event", json_event(event));
-    json_field(out, first, "before", json_snapshot(result.before));
-    json_field(out, first, "before_checks", json_snapshot_checks(result.before));
-    json_field(out, first, "after", json_snapshot(result.after));
-    json_field(out, first, "after_checks", json_snapshot_checks(result.after));
-    json_field(out, first, "effects",
-               json_array(result.effects, [](const PeeringEffect& fx) {
-                   return json_effect(fx);
-               }));
-    out += "}";
-    std::puts(out.c_str());
+static void
+emit_jsonl_step(int sequence_idx, int step_idx, const PeeringEvent &event,
+                const PeeringStateMachine::SnapshotStepResult &result) {
+  auto view = StepJson{
+      .kind = "step",
+      .sequence = sequence_idx,
+      .step = step_idx,
+      .from_state = state_name(result.from),
+      .to_state = state_name(result.to),
+      .event = {event_to_json(event)},
+      .before = {to_json_str(to_snapshot_view(result.before))},
+      .before_checks = {to_json_str(to_checks_view(result.before))},
+      .after = {to_json_str(to_snapshot_view(result.after))},
+      .after_checks = {to_json_str(to_checks_view(result.after))},
+      .effects = {effects_to_json(result.effects)},
+  };
+  fmt::println("{}", to_json_str(view));
 }
 
-static void emit_jsonl_summary(uint64_t seed, int sequences, int total_events) {
-    std::string out = "{";
-    bool first = true;
-    json_field(out, first, "kind", json_string("summary"));
-    json_field(out, first, "seed", json_number(seed));
-    json_field(out, first, "sequences", json_number(sequences));
-    json_field(out, first, "events", json_number(total_events));
-    out += "}";
-    std::puts(out.c_str());
+static void emit_jsonl_summary(uint64_t seed, int sequences,
+                               int total_events) {
+  fmt::println("{}", to_json_str(SummaryJson{
+                         .kind = "summary",
+                         .seed = seed,
+                         .sequences = sequences,
+                         .events = total_events,
+                     }));
 }
 
-// ── Main ─────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────
 
-int main(int argc, char* argv[]) {
-    uint64_t seed = 42;
-    int num_sequences = 5;
-    int num_events = 30;
-    OutputFormat format = OutputFormat::Jsonl;
+int main(int argc, char *argv[]) {
+  uint64_t seed = 42;
+  int num_sequences = 5;
+  int num_events = 30;
+  OutputFormat format = OutputFormat::Jsonl;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-            seed = strtoull(argv[++i], nullptr, 10);
-        } else if (strcmp(argv[i], "--sequences") == 0 && i + 1 < argc) {
-            num_sequences = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) {
-            num_events = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
-            const char* value = argv[++i];
-            if (strcmp(value, "jsonl") == 0) {
-                format = OutputFormat::Jsonl;
-            } else if (strcmp(value, "legacy") == 0) {
-                format = OutputFormat::Legacy;
-            } else {
-                fprintf(stderr, "Unknown format: %s\n", value);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr,
-                    "Usage: %s [--seed N] [--sequences N] [--events N] "
-                    "[--format jsonl|legacy]\n",
-                    argv[0]);
-            return 0;
-        }
+  for (int i = 1; i < argc; i++) {
+    auto arg = std::string_view(argv[i]);
+    if (arg == "--seed" && i + 1 < argc) {
+      seed = std::strtoull(argv[++i], nullptr, 10);
+    } else if (arg == "--sequences" && i + 1 < argc) {
+      num_sequences = std::atoi(argv[++i]);
+    } else if (arg == "--events" && i + 1 < argc) {
+      num_events = std::atoi(argv[++i]);
+    } else if (arg == "--format" && i + 1 < argc) {
+      auto value = std::string_view(argv[++i]);
+      if (value == "jsonl") {
+        format = OutputFormat::Jsonl;
+      } else if (value == "legacy") {
+        format = OutputFormat::Legacy;
+      } else {
+        fmt::print(stderr, "Unknown format: {}\n", value);
+        return 1;
+      }
+    } else if (arg == "--help") {
+      fmt::print(stderr,
+                 "Usage: {} [--seed N] [--sequences N] [--events N] "
+                 "[--format jsonl|legacy]\n",
+                 argv[0]);
+      return 0;
+    }
+  }
+
+  fmt::print(stderr,
+             "Cross-validation driver: seed={} sequences={} events={} "
+             "format={}\n",
+             seed, num_sequences, num_events,
+             format == OutputFormat::Jsonl ? "jsonl" : "legacy");
+
+  int total_events = 0;
+
+  for (int seq_idx = 0; seq_idx < num_sequences; seq_idx++) {
+    uint64_t s = seed + seq_idx;
+    EventGenerator gen(s);
+    PeeringStateMachine::Snapshot snap = PeeringStateMachine().snapshot();
+
+    if (format == OutputFormat::Legacy) {
+      if (seq_idx > 0)
+        fmt::print("SEQUENCE\n");
+    } else {
+      emit_jsonl_sequence_start(seq_idx, s);
     }
 
-    fprintf(stderr, "Cross-validation driver: seed=%lu sequences=%d events=%d format=%s\n",
-            (unsigned long)seed, num_sequences, num_events,
-            format == OutputFormat::Jsonl ? "jsonl" : "legacy");
-
-    int total_events = 0;
-
-    for (int seq_idx = 0; seq_idx < num_sequences; seq_idx++) {
-        uint64_t s = seed + seq_idx;
-        EventGenerator gen(s);
-        PeeringStateMachine::Snapshot snap = PeeringStateMachine().snapshot();
-
-        // Separator between sequences.
-        if (format == OutputFormat::Legacy) {
-            if (seq_idx > 0) printf("SEQUENCE\n");
-        } else {
-            emit_jsonl_sequence_start(seq_idx, s);
-        }
-
-        // Initialize.
-        auto init_event = PeeringEvent(gen.gen_initialize());
-        auto init_result = PeeringStateMachine::step(snap, init_event);
-        if (format == OutputFormat::Legacy) {
-            print_event(init_event);
-            print_state(init_result.after);
-        } else {
-            emit_jsonl_step(seq_idx, 0, init_event, init_result);
-        }
-        snap = init_result.after;
-        total_events++;
-
-        // Generate events.
-        int actual_events = std::uniform_int_distribution<int>(
-            std::min(50, num_events), num_events)(gen.rng);
-
-        for (int ev_idx = 1; ev_idx <= actual_events; ev_idx++) {
-            auto event = gen.gen_event(snap);
-            auto result = PeeringStateMachine::step(snap, event);
-            if (format == OutputFormat::Legacy) {
-                print_event(event);
-                print_state(result.after);
-            } else {
-                emit_jsonl_step(seq_idx, ev_idx, event, result);
-            }
-            snap = result.after;
-            total_events++;
-        }
+    // Initialize.
+    auto init_event = PeeringEvent(gen.gen_initialize());
+    auto init_result = PeeringStateMachine::step(snap, init_event);
+    if (format == OutputFormat::Legacy) {
+      print_event(init_event);
+      print_state(init_result.after);
+    } else {
+      emit_jsonl_step(seq_idx, 0, init_event, init_result);
     }
+    snap = init_result.after;
+    total_events++;
 
-    fprintf(stderr, "Done. Total events: %d\n", total_events);
-    if (format == OutputFormat::Jsonl) {
-        emit_jsonl_summary(seed, num_sequences, total_events);
+    // Generate events.
+    int actual_events = std::uniform_int_distribution<int>(
+        std::min(50, num_events), num_events)(gen.rng);
+
+    for (int ev_idx = 1; ev_idx <= actual_events; ev_idx++) {
+      auto event = gen.gen_event(snap);
+      auto result = PeeringStateMachine::step(snap, event);
+      if (format == OutputFormat::Legacy) {
+        print_event(event);
+        print_state(result.after);
+      } else {
+        emit_jsonl_step(seq_idx, ev_idx, event, result);
+      }
+      snap = result.after;
+      total_events++;
     }
-    return 0;
+  }
+
+  fmt::print(stderr, "Done. Total events: {}\n", total_events);
+  if (format == OutputFormat::Jsonl) {
+    emit_jsonl_summary(seed, num_sequences, total_events);
+  }
+  return 0;
 }
