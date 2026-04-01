@@ -29,7 +29,8 @@ namespace vermilion::peering {
 //                                        → Stray (if replica)
 //
 // Eliminated states and why:
-//   GetLog         → replaced by GetPeerInfo (just collect committed_length)
+//   GetLog         → replaced by GetPeerInfo (collect journal progress +
+//                    image summaries)
 //   GetMissing     → eliminated (no missing set; length comparison suffices)
 //   Backfilling    → merged into Recovering (same operation: push data)
 //   WaitLocal/RemoteRecoveryReserved → eliminated (runtime handles scheduling)
@@ -44,8 +45,8 @@ enum class State : uint8_t {
   Reset,   // Resetting for a new peering interval
 
   // Peering states (primary only)
-  GetPeerInfo, // Querying peers for committed_length (Ceph: GetInfo + GetLog +
-               // GetMissing)
+  GetPeerInfo, // Querying peers for committed journal progress + image
+               // summaries (Ceph: GetInfo + GetLog + GetMissing)
   WaitUpThru,  // Waiting for OSDMap to reflect our up_thru
 
   // Operational states
@@ -141,12 +142,15 @@ struct AllReplicasRecovered {
 struct ReplicaActivate {
   osd_id_t from;      // sender OSD (must be acting primary)
   PeerInfo auth_info; // authoritative peer image from primary
+  AuthorityImage auth_sources;
+  journal_seq_t authoritative_seq = 0;
   epoch_t activation_epoch;
 };
 
 // Replica has been recovered (caught up to the authoritative image).
 // Sent by the runtime to the replica after data push completes.
 struct ReplicaRecoveryComplete {
+  journal_seq_t new_committed_seq = 0;
   uint64_t new_committed_length;
   ObjectImage recovered_image;
   epoch_t activation_epoch;
@@ -198,13 +202,16 @@ struct SendActivate {
   osd_id_t target;
   pg_id_t pgid;
   PeerInfo auth_info;
+  AuthorityImage auth_sources;
+  journal_seq_t authoritative_seq;
   epoch_t activation_epoch;
 };
 
 // PG is now active, start serving IO.
 struct ActivatePG {
   pg_id_t pgid;
-  uint64_t authoritative_length; // the quorum-max committed_length
+  journal_seq_t authoritative_seq;
+  uint64_t authoritative_length; // legacy scalar compatibility summary
   ObjectImage authoritative_image;
   epoch_t activation_epoch;
 };
@@ -222,6 +229,8 @@ struct ScheduleRecovery {
     osd_id_t osd;
     uint64_t peer_length;          // what the peer has
     uint64_t authoritative_length; // what they need
+    journal_seq_t peer_committed_seq;
+    journal_seq_t authoritative_seq;
     std::vector<ObjRecovery> recoveries;
   };
   std::vector<Target> targets;
@@ -257,6 +266,8 @@ struct UpdateHeartbeats {
 struct PublishStats {
   pg_id_t pgid;
   State state;
+  journal_seq_t committed_seq;
+  journal_seq_t authoritative_seq;
   uint64_t committed_length;
   ObjectImage image;
   ObjectImage authoritative_image;

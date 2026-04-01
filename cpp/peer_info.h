@@ -1,12 +1,14 @@
 /*
  * Vermilion simplified peer metadata.
  *
- * Under append-only + single-writer constraints, the entire PGLog
- * collapses to a single scalar: committed_length. There is no
- * divergence, no log merging, no missing set computation.
+ * Under append-only + single-writer constraints, peering no longer needs
+ * Ceph's full PGLog machinery, but it still needs two semantic layers:
  *
- * This replaces Ceph's pg_info_t, pg_log_t, pg_missing_t, and
- * eversion_t for the peering state machine's purposes.
+ *   - a PG-scoped committed journal prefix for IO ordering
+ *   - an objectwise image for recovery planning
+ *
+ * This replaces the parts of Ceph's pg_info_t, pg_log_t, pg_missing_t, and
+ * eversion_t that are relevant to the extracted peering state machine.
  */
 
 #pragma once
@@ -24,7 +26,11 @@ using epoch_t = uint32_t;
 using osd_id_t = int32_t;
 using pg_id_t = uint64_t;
 using object_id_t = uint64_t;
+using journal_seq_t = uint64_t;
 
+// Legacy scalar-compatibility object id used only to translate older
+// committed_length-only inputs into an object image. It is not a semantic
+// "primary object" and must not drive primary selection.
 inline constexpr object_id_t primary_object_id = 0;
 
 // ── Objectwise image summaries ────────────────────────────────────
@@ -42,6 +48,7 @@ using AuthorityImage = std::map<object_id_t, ObjectAuthority>;
 
 struct ObjRecovery {
   object_id_t obj = 0;
+  osd_id_t source = -1;
   uint64_t from_length = 0;
   uint64_t to_length = 0;
 
@@ -50,6 +57,8 @@ struct ObjRecovery {
 
 struct PeerRecoveryPlan {
   osd_id_t target = -1;
+  journal_seq_t peer_committed_seq = 0;
+  journal_seq_t authoritative_seq = 0;
   std::vector<ObjRecovery> recoveries;
 
   bool operator==(const PeerRecoveryPlan &) const = default;
@@ -59,14 +68,15 @@ struct PeerRecoveryPlan {
 
 // Simplified peer metadata. In Ceph this is pg_info_t + pg_log_t +
 // pg_missing_t — hundreds of fields. Under append-only semantics,
-// the only recovery-relevant state is how much data each replica has.
+// the peering-relevant state is:
+//   - how far the peer's committed journal prefix extends
+//   - what committed object image it has materialized
 struct PeerInfo {
   osd_id_t osd = -1;
+  journal_seq_t committed_seq = 0;
 
-  // The key simplification: under append-only + single-writer,
-  // all replicas have the same data up to their committed_length.
-  // There is no divergence — only "you have less than me" or
-  // "you have the same as me".
+  // Legacy scalar compatibility for older image-only reducers and replay.
+  // This is not the ordering source of truth once committed_seq is present.
   uint64_t committed_length = 0;
   ObjectImage image;
 
@@ -86,8 +96,9 @@ struct PeerInfo {
 // Aggregate PG state on this OSD. Replaces pg_info_t.
 struct PGInfo {
   pg_id_t pgid = 0;
+  journal_seq_t committed_seq = 0;
 
-  // How much data we have locally.
+  // Legacy scalar compatibility for older image-only reducers and replay.
   uint64_t committed_length = 0;
   ObjectImage image;
 
@@ -200,13 +211,15 @@ inline bool same_image(const ObjectImage &lhs, const ObjectImage &rhs) {
 }
 
 inline std::vector<ObjRecovery> image_recovery_gaps(const ObjectImage &local,
-                                                    const ObjectImage &auth) {
+                                                    const AuthorityImage &auth) {
   std::vector<ObjRecovery> gaps;
-  for (const auto &[obj, auth_len] : auth) {
+  for (const auto &[obj, source] : auth) {
+    auto auth_len = source.authority_length;
     auto local_len = lookup_length(local, obj);
     if (local_len < auth_len) {
       gaps.push_back(ObjRecovery{
           .obj = obj,
+          .source = source.authority_osd,
           .from_length = local_len,
           .to_length = auth_len,
       });
@@ -272,25 +285,28 @@ inline ObjectImage authority_image_values(const AuthorityImage &auth) {
 }
 
 inline std::vector<ObjRecovery>
-peer_image_recovery_plan(const ObjectImage &auth, const PeerInfo &peer) {
+peer_image_recovery_plan(const AuthorityImage &auth, const PeerInfo &peer) {
   return image_recovery_gaps(effective_image(peer), auth);
 }
 
-inline std::vector<ObjRecovery> pg_image_recovery_plan(const ObjectImage &auth,
+inline std::vector<ObjRecovery> pg_image_recovery_plan(const AuthorityImage &auth,
                                                        const PGInfo &pg) {
   return image_recovery_gaps(effective_image(pg), auth);
 }
 
 inline std::vector<PeerRecoveryPlan>
-build_peer_recovery_plans(const ObjectImage &auth,
+build_peer_recovery_plans(const AuthorityImage &auth,
+                          journal_seq_t authoritative_seq,
                           const std::vector<PeerInfo> &peers) {
   std::vector<PeerRecoveryPlan> plans;
   for (const auto &raw : peers) {
     auto peer = normalized_peer_info(raw);
     auto gaps = peer_image_recovery_plan(auth, peer);
-    if (!gaps.empty()) {
+    if (!gaps.empty() || peer.committed_seq < authoritative_seq) {
       plans.push_back(PeerRecoveryPlan{
           .target = peer.osd,
+          .peer_committed_seq = peer.committed_seq,
+          .authoritative_seq = authoritative_seq,
           .recoveries = std::move(gaps),
       });
     }

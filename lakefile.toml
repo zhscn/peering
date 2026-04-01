@@ -1,0 +1,6 @@
+name = "peering"
+version = "0.1.0"
+defaultTargets = ["Peering"]
+
+[[lean_lib]]
+name = "Peering"

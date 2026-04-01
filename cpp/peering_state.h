@@ -9,8 +9,8 @@
  * simplified for append-only + single-writer semantics.
  *
  * Key simplifications vs Ceph:
- * - No PGLog: committed_length replaces the entire log/missing/divergence
- * machinery
+ * - No full PGLog: peering tracks a committed journal prefix plus an object
+ *   image instead of the full log/missing/divergence machinery
  * - No merge_log/rewind_divergent_log: append-only means no divergence
  * - No separate GetLog/GetMissing phases: just collect committed_length
  * - No backfill vs recovery distinction: both are "push data to short replica"
@@ -62,6 +62,7 @@ public:
 
   // Primary-object compatibility view of the objectwise authority.
   uint64_t authoritative_length() const { return primary_length(auth_image_); }
+  journal_seq_t authoritative_seq() const { return auth_seq_; }
 
   // Peer info collected during peering.
   const std::map<osd_id_t, PeerInfo> &peer_info() const { return peer_info_; }
@@ -78,6 +79,7 @@ public:
     int pool_size;
     int pool_min_size;
     PGInfo local_info;
+    journal_seq_t auth_seq;
     uint64_t auth_length;
     osd_id_t auth_osd;
     ObjectImage auth_image;
@@ -145,6 +147,7 @@ private:
   std::set<osd_id_t> timed_out_probes_; // probes that timed out — may have data
 
   // Objectwise authority and recovery state.
+  journal_seq_t auth_seq_ = 0;
   ObjectImage auth_image_;
   AuthorityImage auth_sources_;
   std::vector<PeerRecoveryPlan> peer_recovery_plans_;
@@ -329,6 +332,7 @@ private:
 
   struct ActingDecision {
     ActingDecisionKind kind = ActingDecisionKind::None;
+    journal_seq_t auth_seq = 0;
     ObjectImage auth_image;
     AuthorityImage auth_sources;
     const char *reason = nullptr;
@@ -391,6 +395,7 @@ private:
 
   struct ReplicaActivationDecision {
     ReplicaActivationDecisionKind kind = ReplicaActivationDecisionKind::None;
+    journal_seq_t auth_seq = 0;
     ObjectImage auth_image;
     AuthorityImage auth_sources;
     epoch_t activation_epoch = 0;
@@ -410,6 +415,7 @@ private:
 
   struct ReplicaRecoveryDecision {
     ReplicaRecoveryDecisionKind kind = ReplicaRecoveryDecisionKind::None;
+    journal_seq_t committed_seq = 0;
     ObjectImage recovered_image;
     epoch_t activation_epoch = 0;
   };

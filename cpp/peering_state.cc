@@ -119,6 +119,7 @@ known_peer_images(osd_id_t whoami, const PGInfo &local_info,
   auto local = normalize_pg_info_copy(local_info);
   peers.push_back(PeerInfo{
       .osd = whoami,
+      .committed_seq = local.committed_seq,
       .committed_length = local.committed_length,
       .image = local.image,
       .last_epoch_started = local.last_epoch_started,
@@ -143,6 +144,7 @@ acting_replica_images(const ActingSet &acting, osd_id_t whoami,
     } else {
       peers.push_back(PeerInfo{
           .osd = osd,
+          .committed_seq = 0,
           .committed_length = 0,
           .image = {},
           .last_epoch_started = 0,
@@ -158,15 +160,27 @@ osd_id_t authority_osd_for(const AuthorityImage &auth, object_id_t obj) {
   return it == auth.end() ? -1 : it->second.authority_osd;
 }
 
+journal_seq_t authoritative_committed_seq(const std::vector<PeerInfo> &infos) {
+  journal_seq_t seq = 0;
+  for (const auto &raw : infos) {
+    auto info = normalized_peer_info(raw);
+    if (info.committed_seq > seq) {
+      seq = info.committed_seq;
+    }
+  }
+  return seq;
+}
+
 std::set<osd_id_t>
 recovery_targets_from_plans(const std::vector<PeerRecoveryPlan> &peer_plans,
                             const std::vector<ObjRecovery> &local_plan,
-                            osd_id_t whoami) {
+                            journal_seq_t local_committed_seq,
+                            journal_seq_t authoritative_seq, osd_id_t whoami) {
   std::set<osd_id_t> targets;
   for (const auto &plan : peer_plans) {
     targets.insert(plan.target);
   }
-  if (!local_plan.empty()) {
+  if (!local_plan.empty() || local_committed_seq < authoritative_seq) {
     targets.insert(whoami);
   }
   return targets;
@@ -291,6 +305,7 @@ void PeeringStateMachine::start_peering_primary(
   // Include ourselves in peer info.
   PeerInfo self_info;
   self_info.osd = whoami_;
+  self_info.committed_seq = local_info_.committed_seq;
   self_info.committed_length = local_info_.committed_length;
   self_info.image = effective_image(local_info_);
   self_info.last_epoch_started = local_info_.last_epoch_started;
@@ -495,6 +510,7 @@ void PeeringStateMachine::refresh_authority_from_known_peers() {
   auto local = normalize_pg_info_copy(local_info_);
   auto peers = normalize_peer_info_map(peer_info_);
   auto known_peers = known_peer_images(whoami_, local, peers);
+  auth_seq_ = authoritative_committed_seq(known_peers);
   auth_sources_ = authoritative_sources(known_peers);
   auth_image_ = authority_image_values(auth_sources_);
 }
@@ -503,8 +519,8 @@ void PeeringStateMachine::refresh_recovery_plans_from_current_authority() {
   auto local = normalize_pg_info_copy(local_info_);
   auto peers = normalize_peer_info_map(peer_info_);
   peer_recovery_plans_ = build_peer_recovery_plans(
-      auth_image_, acting_replica_images(acting_, whoami_, peers));
-  local_recovery_plan_ = pg_image_recovery_plan(auth_image_, local);
+      auth_sources_, auth_seq_, acting_replica_images(acting_, whoami_, peers));
+  local_recovery_plan_ = pg_image_recovery_plan(auth_sources_, local);
 }
 
 void PeeringStateMachine::refresh_image_state_from_known_peers() {
@@ -514,6 +530,7 @@ void PeeringStateMachine::refresh_image_state_from_known_peers() {
 
 std::set<osd_id_t> PeeringStateMachine::image_recovery_targets() const {
   return recovery_targets_from_plans(peer_recovery_plans_, local_recovery_plan_,
+                                     local_info_.committed_seq, auth_seq_,
                                      whoami_);
 }
 
@@ -929,15 +946,14 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   }
 
   decision.kind = ActingDecisionKind::Activate;
+  decision.auth_seq = authoritative_committed_seq(known_peers);
   decision.auth_sources = authoritative_sources(known_peers);
   decision.auth_image = authority_image_values(decision.auth_sources);
   decision.peer_recovery_plans = build_peer_recovery_plans(
-      decision.auth_image, acting_replica_images(acting_, whoami_, peers));
+      decision.auth_sources, decision.auth_seq,
+      acting_replica_images(acting_, whoami_, peers));
   decision.local_recovery_plan =
-      pg_image_recovery_plan(decision.auth_image, local);
-  const uint64_t auth_length = primary_length(decision.auth_image);
-  const osd_id_t auth_osd =
-      authority_osd_for(decision.auth_sources, primary_object_id);
+      pg_image_recovery_plan(decision.auth_sources, local);
 
   // Fix (round 5): If any prior-interval OSD timed out and had the
   // same interval, it might still carry unseen objectwise authority.
@@ -956,12 +972,11 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   std::vector<osd_id_t> want_acting;
   std::set<osd_id_t> in_want;
 
-  // Start with the primary-object authority if the local primary is short.
-  bool primary_is_short =
-      lookup_length(local.image, primary_object_id) < auth_length;
-  osd_id_t desired_primary = whoami_;
-  if (primary_is_short && auth_osd != whoami_ && auth_osd >= 0) {
-    desired_primary = auth_osd;
+  // Keep the acting primary CRUSH-chosen. Journal/image authority determines
+  // recovery sources, not who coordinates the PG.
+  osd_id_t desired_primary = acting_.primary();
+  if (desired_primary < 0) {
+    desired_primary = whoami_;
   }
 
   // Seed with desired primary.
@@ -983,6 +998,7 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   auto is_complete_peer = [&](osd_id_t osd) {
     auto it = peers.find(osd);
     return it != peers.end() &&
+           it->second.committed_seq >= decision.auth_seq &&
            same_image(effective_image(it->second), decision.auth_image);
   };
 
@@ -1021,9 +1037,6 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   //    (a) primary needs to change (desired_primary != current primary), or
   //    (b) an OSD outside acting set needs to be included.
   bool need_acting_change = false;
-  if (desired_primary != acting_.primary()) {
-    need_acting_change = true;
-  }
   for (auto osd : want_acting) {
     if (!acting_.contains(osd)) {
       need_acting_change = true;
@@ -1052,6 +1065,7 @@ void PeeringStateMachine::apply_acting_decision(
     return;
   }
 
+  auth_seq_ = decision.auth_seq;
   auth_image_ = decision.auth_image;
   auth_sources_ = decision.auth_sources;
   peer_recovery_plans_ = decision.peer_recovery_plans;
@@ -1115,6 +1129,7 @@ PeeringStateMachine::decide_activation() const {
   }
 
   decision.clamp_local_to_auth =
+      local_info_.committed_seq >= auth_seq_ &&
       prefix_image(auth_image_, effective_image(local_info_));
   for (auto osd : acting_.osds) {
     if (osd >= 0 && osd != whoami_) {
@@ -1127,18 +1142,24 @@ PeeringStateMachine::decide_activation() const {
     uint64_t peer_len = (it != peer_info_.end())
                             ? primary_length(effective_image(it->second))
                             : 0;
+    journal_seq_t peer_seq =
+        (it != peer_info_.end()) ? it->second.committed_seq : 0;
     decision.recovery_targets.push_back({
         .osd = plan.target,
         .peer_length = peer_len,
         .authoritative_length = primary_length(auth_image_),
+        .peer_committed_seq = peer_seq,
+        .authoritative_seq = auth_seq_,
         .recoveries = plan.recoveries,
     });
   }
-  if (!local_recovery_plan_.empty()) {
+  if (!local_recovery_plan_.empty() || local_info_.committed_seq < auth_seq_) {
     decision.recovery_targets.push_back({
         .osd = whoami_,
         .peer_length = primary_length(effective_image(local_info_)),
         .authoritative_length = primary_length(auth_image_),
+        .peer_committed_seq = local_info_.committed_seq,
+        .authoritative_seq = auth_seq_,
         .recoveries = local_recovery_plan_,
     });
   }
@@ -1167,6 +1188,7 @@ void PeeringStateMachine::apply_activation_decision(
   local_info_.last_interval_started = epoch_;
   if (decision.clamp_local_to_auth) {
     local_info_.image = auth_image_;
+    local_info_.committed_seq = auth_seq_;
     local_info_.committed_length = primary_length(auth_image_);
   }
   refresh_recovery_plans_from_current_authority();
@@ -1178,6 +1200,7 @@ void PeeringStateMachine::apply_activation_decision(
   for (auto osd : decision.activate_replicas) {
     PeerInfo auth_info;
     auth_info.osd = whoami_;
+    auth_info.committed_seq = auth_seq_;
     auth_info.committed_length = primary_length(auth_image_);
     auth_info.image = auth_image_;
     auth_info.last_epoch_started = epoch_;
@@ -1187,6 +1210,8 @@ void PeeringStateMachine::apply_activation_decision(
         .target = osd,
         .pgid = pgid_,
         .auth_info = auth_info,
+        .auth_sources = auth_sources_,
+        .authoritative_seq = auth_seq_,
         .activation_epoch = epoch_,
     });
   }
@@ -1194,6 +1219,7 @@ void PeeringStateMachine::apply_activation_decision(
   // Emit ActivatePG so the runtime starts serving IO.
   fx.push_back(effect::ActivatePG{
       .pgid = pgid_,
+      .authoritative_seq = auth_seq_,
       .authoritative_length = primary_length(auth_image_),
       .authoritative_image = auth_image_,
       .activation_epoch = epoch_,
@@ -1299,12 +1325,14 @@ void PeeringStateMachine::apply_recovery_progress_decision(
 
     auto &info = peer_info_[peer];
     info.osd = peer;
+    info.committed_seq = auth_seq_;
     info.committed_length = primary_length(auth_image_);
     info.image = auth_image_;
   }
 
   if (decision.update_local_to_auth) {
     local_info_.image = auth_image_;
+    local_info_.committed_seq = auth_seq_;
     local_info_.committed_length = primary_length(auth_image_);
   }
   refresh_recovery_plans_from_current_authority();
@@ -1341,10 +1369,15 @@ PeeringStateMachine::decide_replica_activation(
 
   auto auth_info = normalize_peer_info_copy(e.auth_info);
   decision.kind = ReplicaActivationDecisionKind::Activate;
-  decision.auth_image = auth_info.image;
-  decision.auth_sources = authority_from_peer_info(auth_info);
+  decision.auth_seq =
+      e.authoritative_seq > 0 ? e.authoritative_seq : auth_info.committed_seq;
+  decision.auth_sources = !e.auth_sources.empty() ? e.auth_sources
+                                                  : authority_from_peer_info(auth_info);
+  decision.auth_image = !decision.auth_sources.empty()
+                            ? authority_image_values(decision.auth_sources)
+                            : auth_info.image;
   decision.activation_epoch = e.activation_epoch;
-  decision.advance_history =
+  decision.advance_history = decision.auth_seq <= local_info_.committed_seq &&
       prefix_image(decision.auth_image, effective_image(local_info_));
   return decision;
 }
@@ -1355,14 +1388,19 @@ void PeeringStateMachine::apply_replica_activation_decision(
     return;
   }
 
+  auth_seq_ = decision.auth_seq;
   auth_image_ = decision.auth_image;
   auth_sources_ = decision.auth_sources;
 
   // Fix (round 1+8): Advance LES only for a fully caught-up replica and
   // clamp any overlong local tail to the chosen authority.
   local_info_.image = clamp_image_to(auth_image_, effective_image(local_info_));
+  if (local_info_.committed_seq > auth_seq_) {
+    local_info_.committed_seq = auth_seq_;
+  }
   local_info_.committed_length = primary_length(local_info_.image);
   if (decision.advance_history) {
+    local_info_.committed_seq = auth_seq_;
     local_info_.last_epoch_started = decision.activation_epoch;
     local_info_.last_interval_started = decision.activation_epoch;
   }
@@ -1382,7 +1420,7 @@ PeeringStateMachine::decide_replica_recovery_complete(
     return decision;
 
   // Fix (round 7): Monotonicity guards — reject stale completions that
-  // would roll back committed_length or epoch history.
+  // would roll back committed journal progress or epoch history.
   if (e.activation_epoch < last_peering_reset_)
     return decision;
   auto recovered_image = e.recovered_image;
@@ -1395,8 +1433,18 @@ PeeringStateMachine::decide_replica_recovery_complete(
     return decision;
   if (e.activation_epoch < local_info_.last_epoch_started)
     return decision;
+  journal_seq_t recovered_seq = e.new_committed_seq;
+  if (recovered_seq == 0 && !recovered_image.empty() &&
+      same_image(recovered_image, auth_image_)) {
+    recovered_seq = auth_seq_;
+  }
+  if (recovered_seq < local_info_.committed_seq)
+    return decision;
+  if (recovered_seq > auth_seq_)
+    return decision;
 
   decision.kind = ReplicaRecoveryDecisionKind::Complete;
+  decision.committed_seq = recovered_seq;
   decision.recovered_image = clamped;
   decision.activation_epoch = e.activation_epoch;
   return decision;
@@ -1409,6 +1457,7 @@ void PeeringStateMachine::apply_replica_recovery_decision(
   }
 
   local_info_.image = decision.recovered_image;
+  local_info_.committed_seq = decision.committed_seq;
   local_info_.committed_length = primary_length(decision.recovered_image);
   local_info_.last_epoch_started = decision.activation_epoch;
   local_info_.last_interval_started = decision.activation_epoch;
@@ -1429,7 +1478,9 @@ void PeeringStateMachine::publish_stats(Effects &fx) {
   fx.push_back(effect::PublishStats{
       .pgid = pgid_,
       .state = state_,
-      .committed_length = primary_length(auth_image_),
+      .committed_seq = local_info_.committed_seq,
+      .authoritative_seq = auth_seq_,
+      .committed_length = primary_length(effective_image(local_info_)),
       .image = effective_image(local_info_),
       .authoritative_image = auth_image_,
       .acting_size = acting_.size(),
@@ -1443,6 +1494,7 @@ void PeeringStateMachine::reset_peering_state() {
   peers_responded_.clear();
   timed_out_probes_.clear();
   prior_osds_.clear();
+  auth_seq_ = 0;
   auth_image_.clear();
   auth_sources_.clear();
   peer_recovery_plans_.clear();
@@ -1463,7 +1515,8 @@ PeeringStateMachine::Snapshot PeeringStateMachine::snapshot() const {
   auto peer_recovery_plans = peer_recovery_plans_;
   auto local_recovery_plan = local_recovery_plan_;
   std::set<osd_id_t> recovery_targets = recovery_targets_from_plans(
-      peer_recovery_plans, local_recovery_plan, whoami_);
+      peer_recovery_plans, local_recovery_plan, local_info.committed_seq,
+      auth_seq_, whoami_);
   std::set<osd_id_t> recovered = recovered_;
   if (state_ == State::Clean) {
     recovery_targets.clear();
@@ -1482,6 +1535,7 @@ PeeringStateMachine::Snapshot PeeringStateMachine::snapshot() const {
       .pool_size = pool_size_,
       .pool_min_size = pool_min_size_,
       .local_info = local_info,
+      .auth_seq = auth_seq_,
       .auth_length = primary_length(auth_image),
       .auth_osd = authority_osd_for(auth_sources, primary_object_id),
       .auth_image = auth_image,
@@ -1513,6 +1567,7 @@ PeeringStateMachine PeeringStateMachine::from_snapshot(const Snapshot &s) {
   sm.pool_size_ = s.pool_size;
   sm.pool_min_size_ = s.pool_min_size;
   sm.local_info_ = normalize_pg_info_copy(s.local_info);
+  sm.auth_seq_ = s.auth_seq;
   sm.auth_image_ =
       !s.auth_image.empty()
           ? s.auth_image
@@ -1524,13 +1579,18 @@ PeeringStateMachine PeeringStateMachine::from_snapshot(const Snapshot &s) {
                          ? s.auth_sources
                          : authority_from_image(s.auth_osd, sm.auth_image_);
   sm.peer_info_ = normalize_peer_info_map(s.peer_info);
+  if (sm.auth_seq_ == 0) {
+    sm.auth_seq_ = authoritative_committed_seq(
+        known_peer_images(sm.whoami_, sm.local_info_, sm.peer_info_));
+  }
   sm.peers_queried_ = s.peers_queried;
   sm.peers_responded_ = s.peers_responded;
   sm.prior_osds_ = s.prior_osds;
   sm.peer_recovery_plans_ = s.peer_recovery_plans;
   sm.local_recovery_plan_ = s.local_recovery_plan;
   if (sm.peer_recovery_plans_.empty() && sm.local_recovery_plan_.empty() &&
-      !sm.auth_image_.empty() && s.state != State::Clean) {
+      (sm.auth_seq_ > 0 || !sm.auth_image_.empty()) &&
+      s.state != State::Clean) {
     sm.refresh_recovery_plans_from_current_authority();
   }
   sm.recovered_ = s.recovered;
