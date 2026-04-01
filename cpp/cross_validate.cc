@@ -1,10 +1,10 @@
 /*
- * Cross-validation driver: generates event sequences, processes them
+ * Cross-validation driver: generates one random event trace, processes it
  * through the C++ state machine, and outputs replay traces.
  *
  * Protocol (stdout):
  *   Default: JSON Lines (`--format jsonl`)
- *     One structured object per sequence start, replay step, and final summary.
+ *     One structured object per replay step and final summary.
  *
  *   Compatibility: line-based legacy format (`--format legacy`)
  *     Kept for older exploratory tooling.
@@ -14,7 +14,8 @@
  *   cmake --build build --target cross_validate
  *
  * Run:
- *   ./build/cpp/cross_validate --seed 42 --sequences 5 --events 30
+ *   ./build/cpp/cross_validate --seed 42 --events 30
+ *   ./build/cpp/cross_validate --profile lean-core --seed 1 --events 25
  */
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 #include <glaze/glaze.hpp>
+#include <CLI/CLI.hpp>
 
 #include "peering_state.h"
 
@@ -323,22 +325,14 @@ struct DeleteCompleteTagged {
 };
 
 // JSONL wrapper types
-struct SequenceStartJson {
-  std::string kind = "sequence_start";
-  int sequence{};
-  uint64_t seed{};
-};
-
 struct SummaryJson {
   std::string kind = "summary";
   uint64_t seed{};
-  int sequences{};
   int events{};
 };
 
 struct StepJson {
   std::string kind = "step";
-  int sequence{};
   int step{};
   std::string from_state;
   std::string to_state;
@@ -870,6 +864,7 @@ static auto to_checks_view(const PeeringStateMachine::Snapshot &snap)
 // ── Event generator ─────────────────────────────────────────────────
 
 enum class OutputFormat { Legacy, Jsonl };
+enum class EventProfile { Full, LeanCore };
 
 struct TestConfig {
   int num_osds;
@@ -883,8 +878,10 @@ struct TestConfig {
 struct EventGenerator {
   std::mt19937 rng;
   TestConfig cfg;
+  EventProfile profile;
 
-  explicit EventGenerator(uint64_t seed) : rng(seed) {}
+  explicit EventGenerator(uint64_t seed, EventProfile profile = EventProfile::Full)
+      : rng(seed), profile(profile) {}
 
   TestConfig gen_config() {
     TestConfig c;
@@ -965,6 +962,9 @@ struct EventGenerator {
   }
 
   PeeringEvent gen_event(const PeeringStateMachine::Snapshot &snap) {
+    if (profile == EventProfile::LeanCore) {
+      return gen_lean_core_event(snap);
+    }
     int choice = std::uniform_int_distribution<int>(0, 99)(rng);
     switch (snap.state) {
     case State::Initial:
@@ -1047,6 +1047,52 @@ struct EventGenerator {
       return gen_advance_map(snap);
     default:
       return gen_advance_map(snap);
+    }
+  }
+
+  PeeringEvent gen_lean_core_event(const PeeringStateMachine::Snapshot &snap) {
+    int choice = std::uniform_int_distribution<int>(0, 99)(rng);
+    switch (snap.state) {
+    case State::Initial:
+      return gen_peer_info_received(snap);
+    case State::GetPeerInfo:
+      if (choice < 70)
+        return gen_peer_info_received(snap);
+      return gen_peer_query_timeout(snap);
+    case State::WaitUpThru:
+      if (choice < 60)
+        return gen_up_thru_updated(snap);
+      return gen_peer_info_received(snap);
+    case State::Active:
+      if (choice < 40)
+        return event::ActivateCommitted{};
+      if (choice < 70)
+        return gen_all_replicas_recovered(snap);
+      return gen_recovery_complete(snap);
+    case State::Recovering:
+      if (choice < 50)
+        return gen_recovery_complete(snap);
+      if (choice < 75)
+        return gen_all_replicas_recovered(snap);
+      return event::ActivateCommitted{};
+    case State::Clean:
+      return event::ActivateCommitted{};
+    case State::Stray:
+      return gen_replica_activate(snap);
+    case State::ReplicaActive:
+      if (choice < 60)
+        return gen_replica_recovery_complete(snap);
+      return gen_replica_activate(snap);
+    case State::Down:
+      if (choice < 60)
+        return gen_peer_info_received(snap);
+      return gen_peer_query_timeout(snap);
+    case State::Incomplete:
+      return gen_peer_info_received(snap);
+    case State::Deleting:
+      return event::DeleteComplete{};
+    default:
+      return gen_peer_info_received(snap);
     }
   }
 
@@ -1472,20 +1518,11 @@ static void print_state(const PeeringStateMachine::Snapshot &snap) {
 
 // ── JSONL output ────────────────────────────────────────────────────
 
-static void emit_jsonl_sequence_start(int sequence_idx, uint64_t seed) {
-  fmt::println("{}", to_json_str(SequenceStartJson{
-                         .kind = "sequence_start",
-                         .sequence = sequence_idx,
-                         .seed = seed,
-                     }));
-}
-
 static void
-emit_jsonl_step(int sequence_idx, int step_idx, const PeeringEvent &event,
+emit_jsonl_step(int step_idx, const PeeringEvent &event,
                 const PeeringStateMachine::SnapshotStepResult &result) {
   auto view = StepJson{
       .kind = "step",
-      .sequence = sequence_idx,
       .step = step_idx,
       .from_state = state_name(result.from),
       .to_state = state_name(result.to),
@@ -1499,12 +1536,10 @@ emit_jsonl_step(int sequence_idx, int step_idx, const PeeringEvent &event,
   fmt::println("{}", to_json_str(view));
 }
 
-static void emit_jsonl_summary(uint64_t seed, int sequences,
-                               int total_events) {
+static void emit_jsonl_summary(uint64_t seed, int total_events) {
   fmt::println("{}", to_json_str(SummaryJson{
                          .kind = "summary",
                          .seed = seed,
-                         .sequences = sequences,
                          .events = total_events,
                      }));
 }
@@ -1513,90 +1548,67 @@ static void emit_jsonl_summary(uint64_t seed, int sequences,
 
 int main(int argc, char *argv[]) {
   uint64_t seed = 42;
-  int num_sequences = 5;
   int num_events = 30;
-  OutputFormat format = OutputFormat::Jsonl;
+  std::string format_str = "jsonl";
+  std::string profile_str = "full";
 
-  for (int i = 1; i < argc; i++) {
-    auto arg = std::string_view(argv[i]);
-    if (arg == "--seed" && i + 1 < argc) {
-      seed = std::strtoull(argv[++i], nullptr, 10);
-    } else if (arg == "--sequences" && i + 1 < argc) {
-      num_sequences = std::atoi(argv[++i]);
-    } else if (arg == "--events" && i + 1 < argc) {
-      num_events = std::atoi(argv[++i]);
-    } else if (arg == "--format" && i + 1 < argc) {
-      auto value = std::string_view(argv[++i]);
-      if (value == "jsonl") {
-        format = OutputFormat::Jsonl;
-      } else if (value == "legacy") {
-        format = OutputFormat::Legacy;
-      } else {
-        fmt::print(stderr, "Unknown format: {}\n", value);
-        return 1;
-      }
-    } else if (arg == "--help") {
-      fmt::print(stderr,
-                 "Usage: {} [--seed N] [--sequences N] [--events N] "
-                 "[--format jsonl|legacy]\n",
-                 argv[0]);
-      return 0;
-    }
-  }
+  CLI::App app{"Cross-validation driver for peering state machine"};
+  app.add_option("--seed", seed, "Random seed")->default_val(42);
+  app.add_option("--events", num_events, "Max events per trace")->default_val(30);
+  app.add_option("--format", format_str, "Output format: jsonl|legacy")
+      ->default_val("jsonl")
+      ->check(CLI::IsMember({"jsonl", "legacy"}));
+  app.add_option("--profile", profile_str, "Event profile: full|lean-core")
+      ->default_val("full")
+      ->check(CLI::IsMember({"full", "lean-core"}));
+
+  CLI11_PARSE(app, argc, argv);
+
+  OutputFormat format =
+      (format_str == "legacy") ? OutputFormat::Legacy : OutputFormat::Jsonl;
+  EventProfile profile =
+      (profile_str == "lean-core") ? EventProfile::LeanCore : EventProfile::Full;
 
   fmt::print(stderr,
-             "Cross-validation driver: seed={} sequences={} events={} "
-             "format={}\n",
-             seed, num_sequences, num_events,
-             format == OutputFormat::Jsonl ? "jsonl" : "legacy");
+             "Cross-validation driver: seed={} events={} format={} profile={}\n",
+             seed, num_events,
+             format == OutputFormat::Jsonl ? "jsonl" : "legacy",
+             profile == EventProfile::LeanCore ? "lean-core" : "full");
 
   int total_events = 0;
+  EventGenerator gen(seed, profile);
+  PeeringStateMachine::Snapshot snap = PeeringStateMachine().snapshot();
 
-  for (int seq_idx = 0; seq_idx < num_sequences; seq_idx++) {
-    uint64_t s = seed + seq_idx;
-    EventGenerator gen(s);
-    PeeringStateMachine::Snapshot snap = PeeringStateMachine().snapshot();
+  auto init_event = PeeringEvent(gen.gen_initialize());
+  auto init_result = PeeringStateMachine::step(snap, init_event);
+  if (format == OutputFormat::Legacy) {
+    print_event(init_event);
+    print_state(init_result.after);
+  } else {
+    emit_jsonl_step(0, init_event, init_result);
+  }
+  snap = init_result.after;
+  total_events++;
 
+  int actual_events = std::uniform_int_distribution<int>(
+      std::min(50, num_events), num_events)(gen.rng);
+
+  for (int ev_idx = 1; ev_idx <= actual_events; ev_idx++) {
+    auto event = gen.gen_event(snap);
+    auto result = PeeringStateMachine::step(snap, event);
     if (format == OutputFormat::Legacy) {
-      if (seq_idx > 0)
-        fmt::print("SEQUENCE\n");
+      print_event(event);
+      print_state(result.after);
     } else {
-      emit_jsonl_sequence_start(seq_idx, s);
+      emit_jsonl_step(ev_idx, event, result);
     }
-
-    // Initialize.
-    auto init_event = PeeringEvent(gen.gen_initialize());
-    auto init_result = PeeringStateMachine::step(snap, init_event);
-    if (format == OutputFormat::Legacy) {
-      print_event(init_event);
-      print_state(init_result.after);
-    } else {
-      emit_jsonl_step(seq_idx, 0, init_event, init_result);
-    }
-    snap = init_result.after;
+    snap = result.after;
     total_events++;
-
-    // Generate events.
-    int actual_events = std::uniform_int_distribution<int>(
-        std::min(50, num_events), num_events)(gen.rng);
-
-    for (int ev_idx = 1; ev_idx <= actual_events; ev_idx++) {
-      auto event = gen.gen_event(snap);
-      auto result = PeeringStateMachine::step(snap, event);
-      if (format == OutputFormat::Legacy) {
-        print_event(event);
-        print_state(result.after);
-      } else {
-        emit_jsonl_step(seq_idx, ev_idx, event, result);
-      }
-      snap = result.after;
-      total_events++;
-    }
   }
 
   fmt::print(stderr, "Done. Total events: {}\n", total_events);
   if (format == OutputFormat::Jsonl) {
-    emit_jsonl_summary(seed, num_sequences, total_events);
+    emit_jsonl_summary(seed, total_events);
   }
   return 0;
 }

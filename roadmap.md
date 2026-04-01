@@ -128,10 +128,26 @@ Those modules are still useful mainly for:
 - The first Lean modules are in place:
   - [`Peering/Types.lean`](/home/zhscn/code/peering-lean/Peering/Types.lean)
   - [`Peering/Image.lean`](/home/zhscn/code/peering-lean/Peering/Image.lean)
+  - [`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean)
+  - [`Peering/Replay.lean`](/home/zhscn/code/peering-lean/Peering/Replay.lean)
+  - [`PeeringReplay.lean`](/home/zhscn/code/peering-lean/PeeringReplay.lean)
 - The Lean type/image layer now includes:
   - compact journal-progress fields,
   - source-aware object recovery records,
   - source-aware recovery-plan scaffolding.
+- Lean now has an executable reducer boundary with:
+  - compact semantic snapshots,
+  - `validateEvent`,
+  - `reduceValidated`,
+  - `step`.
+- Lean now has a first structured replay bridge with:
+  - JSONL parsing for `cross_validate` output,
+  - step-by-step replay against the Lean reducer,
+  - normalization for ordering noise in effects and set/map-like fields.
+- The repo now has a checked-in replay executable and CI path:
+  - `peering-replay` validates JSONL traces from Lean,
+  - GitHub Actions builds C++, builds Lean, generates a `lean-core` replay
+    trace, and checks it through the Lean executable.
 - The first Lean-oriented design notes are in place:
   - [`docs/lean-design-summary.md`](/home/zhscn/code/peering-lean/docs/lean-design-summary.md)
   - [`docs/idris-reference-notes.md`](/home/zhscn/code/peering-lean/docs/idris-reference-notes.md)
@@ -144,16 +160,13 @@ Idris status:
 
 ### In progress
 
-- settling the first compact Lean semantic state
-- preserving the validated-event boundary in Lean
-- moving from the type/image layer to a small executable reducer subset in
-  `Machine.lean`
+- tightening the replay normalization boundary
+- deciding which independent semantic checks should be reimplemented in Lean
+- preparing the first explicit invariant layer over the executable reducer
 
 ### Not done yet
 
-- `Machine.lean`
 - explicit Lean invariants over reachable semantic state
-- replay parsing and comparison against the updated C++ output shape
 - refinement/simulation theorems
 
 ## Lean Scope Right Now
@@ -174,13 +187,11 @@ concerns into the core reducer too early.
 
 ## Immediate Next Milestone
 
-The next concrete milestone is still:
+The next concrete milestone is:
 
-- implement `Machine.lean`
-- define `validateEvent`
-- define `reduceValidated`
-- define `step`
-- support a small event subset
+- tighten `Replay.lean` around the reduced semantic projection
+- reimplement the first independent semantic checks in Lean
+- define explicit invariants over reachable Lean snapshots
 - prove one meaningful image-safety preservation theorem
 
 The first event subset should stay small:
@@ -194,8 +205,8 @@ The first event subset should stay small:
 - `RecoveryComplete`
 - `AllReplicasRecovered`
 
-`AdvanceMap` should be added immediately after that first reducer milestone,
-because interval changes and `min_size` logic are where the model starts to
+`AdvanceMap` should be added immediately after that first invariant/replay
+milestone because interval changes and `min_size` logic are where the model starts to
 interact with more realistic peering control flow.
 
 No separate `Backfill` state should be introduced at this stage. The semantic

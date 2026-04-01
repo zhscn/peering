@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-replay:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lean toolchain
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          cmake --version
+          c++ --version
+          lake --version
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G Ninja
+
+      - name: Build cross_validate
+        run: cmake --build build --target cross_validate
+
+      - name: Build Lean targets
+        run: |
+          lake build
+          lake build peering-replay
+
+      - name: Generate replay trace
+        run: |
+          mkdir -p artifacts
+          ./build/cpp/cross_validate --profile lean-core --seed 1 --events 25 > artifacts/replay.jsonl
+
+      - name: Replay trace in Lean
+        run: ./.lake/build/bin/peering-replay artifacts/replay.jsonl
+
+      - name: Upload replay trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-trace
+          path: artifacts/replay.jsonl

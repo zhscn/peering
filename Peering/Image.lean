@@ -106,7 +106,7 @@ def lookupAuthorityEntries (obj : ObjectId) :
   | [] => {}
   | (obj', authority) :: rest =>
       let best := lookupAuthorityEntries obj rest
-      if obj' = obj && best.authorityLength < authority.authorityLength then
+      if obj' = obj && best.authorityLength ≤ authority.authorityLength then
         authority
       else
         best
@@ -155,7 +155,16 @@ def authorityImageValues (auth : AuthorityImage) : ObjectImage :=
   { entries := entries }
 
 def authoritativeSources (infos : List PeerInfo) : AuthorityImage :=
-  { entries := infos.foldr (fun info acc => (authorityFromPeerInfo info).entries ++ acc) [] }
+  let raw : AuthorityImage :=
+    { entries := infos.foldr (fun info acc => (authorityFromPeerInfo info).entries ++ acc) [] }
+  let entries :=
+    (AuthorityImage.support raw).filterMap fun obj =>
+      let authority := lookupAuthority raw obj
+      if authority.authorityLength = 0 then
+        none
+      else
+        some (obj, authority)
+  { entries := entries }
 
 def authoritativeImage (infos : List PeerInfo) : ObjectImage :=
   authorityImageValues (authoritativeSources infos)

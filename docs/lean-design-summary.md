@@ -185,6 +185,9 @@ The repo now has a working Lean scaffold:
 
 - [`Peering/Types.lean`](/home/zhscn/code/peering-lean/Peering/Types.lean)
 - [`Peering/Image.lean`](/home/zhscn/code/peering-lean/Peering/Image.lean)
+- [`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean)
+- [`Peering/Replay.lean`](/home/zhscn/code/peering-lean/Peering/Replay.lean)
+- [`PeeringReplay.lean`](/home/zhscn/code/peering-lean/PeeringReplay.lean)
 
 Current coverage:
 
@@ -192,8 +195,13 @@ Current coverage:
 - compact journal-progress fields now exist in `Types.lean`
 - the first image-algebra layer exists
 - source-aware recovery-gap and recovery-plan helpers now exist in `Image.lean`
+- an executable reducer skeleton now exists in `Machine.lean`
+- a first structured JSONL replay parser/checker now exists in `Replay.lean`
+- the checked-in `peering-replay` executable validates JSONL traces directly
 - basic algebra lemmas are proved
 - the project builds with `lake build`
+- GitHub Actions now runs the C++ trace generator plus Lean replay under the
+  `lean-core` event profile
 
 Project status:
 
@@ -203,23 +211,24 @@ Project status:
 
 Not implemented yet:
 
-- `Machine.lean`
 - `Invariants.lean`
-- replay parsing/comparison against the updated C++ trace shape
 - refinement statements
+- tighter replay normalization over the reduced semantic projection
+- independent semantic-check recomputation in Lean
 
 ## Immediate Next Step
 
-The next file should be `Machine.lean` with:
+The next step should be:
 
-1. `validateEvent`
-2. `reduceValidated`
-3. `step`
+1. tighten `Replay.lean` around the reduced semantic projection
+2. reimplement the first independent semantic checks in Lean
+3. add `Invariants.lean`
 
-That module should preserve the C++ reducer boundary exactly and support the
-small first event subset listed above.
+That should keep the replay workflow soundness-first while moving the proof
+layer onto explicit Lean propositions instead of only executable comparison.
 
-It should also preserve the current extracted C++ event/effect surface:
+The next proof-facing layer should preserve the current extracted C++ semantic
+surface:
 
 - explicit `authoritativeSeq`
 - source-aware activation

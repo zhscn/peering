@@ -14,7 +14,14 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-FetchContent_MakeAvailable(glaze fmt)
+FetchContent_Declare(
+  CLI11
+  GIT_REPOSITORY https://github.com/CLIUtils/CLI11
+  GIT_TAG v2.6.2
+  GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(glaze fmt CLI11)
 
 add_library(peering_state STATIC
   peering_state.cc
@@ -36,4 +43,5 @@ target_link_libraries(cross_validate
     peering_state
     glaze::glaze
     fmt::fmt
+    CLI11::CLI11
 )

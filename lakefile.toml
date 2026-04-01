@@ -4,3 +4,7 @@ defaultTargets = ["Peering"]
 
 [[lean_lib]]
 name = "Peering"
+
+[[lean_exe]]
+name = "peering-replay"
+root = "PeeringReplay"
