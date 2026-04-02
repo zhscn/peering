@@ -74,23 +74,23 @@ not just object images alone.
 
 The current reducer semantics live in the C++ files:
 
-- [`peer_info.h`](/home/zhscn/code/peering-lean/cpp/peer_info.h)
-- [`peering_types.h`](/home/zhscn/code/peering-lean/cpp/peering_types.h)
-- [`peering_state.h`](/home/zhscn/code/peering-lean/cpp/peering_state.h)
-- [`peering_state.cc`](/home/zhscn/code/peering-lean/cpp/peering_state.cc)
+- [`peer_info.h`](cpp/peer_info.h)
+- [`peering_types.h`](cpp/peering_types.h)
+- [`peering_state.h`](cpp/peering_state.h)
+- [`peering_state.cc`](cpp/peering_state.cc)
 
 ### Early exploration / legacy reference
 
 These are kept as early exploration material and historical reference. They are
 not maintained as an active semantic model and are not translation targets:
 
-- [`cross_validate.cc`](/home/zhscn/code/peering-lean/cpp/cross_validate.cc)
-- [`idris/src/Peering/ObjectImage.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/ObjectImage.idr)
-- [`idris/src/Peering/Types.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/Types.idr)
-- [`idris/src/Peering/ImageMachine.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/ImageMachine.idr)
-- [`idris/src/Peering/ImageProcess.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/ImageProcess.idr)
-- [`idris/src/Peering/ImageInvariants.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/ImageInvariants.idr)
-- [`idris/src/Peering/ImageRefinement.idr`](/home/zhscn/code/peering-lean/idris/src/Peering/ImageRefinement.idr)
+- [`cross_validate.cc`](cpp/cross_validate.cc)
+- [`idris/src/Peering/ObjectImage.idr`](idris/src/Peering/ObjectImage.idr)
+- [`idris/src/Peering/Types.idr`](idris/src/Peering/Types.idr)
+- [`idris/src/Peering/ImageMachine.idr`](idris/src/Peering/ImageMachine.idr)
+- [`idris/src/Peering/ImageProcess.idr`](idris/src/Peering/ImageProcess.idr)
+- [`idris/src/Peering/ImageInvariants.idr`](idris/src/Peering/ImageInvariants.idr)
+- [`idris/src/Peering/ImageRefinement.idr`](idris/src/Peering/ImageRefinement.idr)
 
 Those modules are still useful mainly for:
 
@@ -126,11 +126,11 @@ Those modules are still useful mainly for:
   - recomputed semantic checks.
 - A Lean project now exists and builds successfully with `lake build`.
 - The first Lean modules are in place:
-  - [`Peering/Types.lean`](/home/zhscn/code/peering-lean/Peering/Types.lean)
-  - [`Peering/Image.lean`](/home/zhscn/code/peering-lean/Peering/Image.lean)
-  - [`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean)
-  - [`Peering/Replay.lean`](/home/zhscn/code/peering-lean/Peering/Replay.lean)
-  - [`PeeringReplay.lean`](/home/zhscn/code/peering-lean/PeeringReplay.lean)
+  - [`Peering/Types.lean`](Peering/Types.lean)
+  - [`Peering/Image.lean`](Peering/Image.lean)
+  - [`Peering/Machine.lean`](Peering/Machine.lean)
+  - [`Peering/Replay.lean`](Peering/Replay.lean)
+  - [`PeeringReplay.lean`](PeeringReplay.lean)
 - The Lean type/image layer now includes:
   - compact journal-progress fields,
   - source-aware object recovery records,
@@ -145,7 +145,7 @@ Those modules are still useful mainly for:
   - step-by-step replay against the Lean reducer,
   - normalization for ordering noise in effects and set/map-like fields.
 - Lean now has an explicit first invariant layer in:
-  - [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean)
+  - [`Peering/Invariants.lean`](Peering/Invariants.lean)
   - executable invariant checks mirroring the current C++ replay checks,
   - the first structural lemmas connecting clean/recovering checks back to the
     base image invariant.
@@ -156,8 +156,8 @@ Those modules are still useful mainly for:
   - GitHub Actions builds C++, builds Lean, generates a `lean-core` replay
     trace, and checks it through the Lean executable.
 - The first Lean-oriented design notes are in place:
-  - [`docs/lean-design-summary.md`](/home/zhscn/code/peering-lean/docs/lean-design-summary.md)
-  - [`docs/idris-reference-notes.md`](/home/zhscn/code/peering-lean/docs/idris-reference-notes.md)
+  - [`docs/lean-design-summary.md`](docs/lean-design-summary.md)
+  - [`docs/idris-reference-notes.md`](docs/idris-reference-notes.md)
 
 Idris status:
 
@@ -165,7 +165,7 @@ Idris status:
 - it is kept only as early exploration and historical proof/replay reference
 - current maintained semantics are the extracted C++ reducer plus Lean
 
-### In progress
+### Optional extension work
 
 - lifting the current replay-facing theorem layer into cleaner generic
   reachable-state/refinement statements
@@ -174,7 +174,7 @@ Idris status:
 - broadening replay/refinement statements beyond the current supported event
   surface and invariant-ok replay traces
 
-### Not done yet
+### Outside the finished scope
 
 - stronger reachable-state reasoning that is not phrased through explicit
   supported-trace witnesses
@@ -183,7 +183,7 @@ Idris status:
 
 ## Lean Scope Right Now
 
-The Lean effort should proceed in this order:
+The Lean effort proceeded in this order:
 
 1. compact journal-progress model
 2. image algebra
@@ -197,18 +197,19 @@ The Lean effort should proceed in this order:
 This keeps the project proof-oriented and avoids pulling replay and refinement
 concerns into the core reducer too early.
 
-## Immediate Next Milestone
+## Optional Follow-On Work
 
-The next concrete milestone is:
+The scoped proof project is complete. If work resumes, the highest-value
+follow-on items are:
 
-- keep replay green on the current reduced semantic projection, including
-  `AdvanceMap`
-- preserve the theorem surface at the handler, `reduceValidated`, `step`, and
-  supported-trace boundaries
-- preserve the new replay-facing theorem layer that connects successful replay
-  to theorem-level invariants
-- fold that replay theorem layer back into cleaner generic
+- fold the replay-facing theorem layer back into cleaner generic
   reachable-state/refinement statements
+- reduce duplication between replay-supported traces and the generic
+  `step`/reachable-state surface
+- broaden replay/refinement statements beyond the current supported event
+  surface and invariant-ok replay traces
+- widen the proved event surface only when additional C++ paths become
+  caller-critical
 
 The first event subset should stay small:
 
@@ -222,7 +223,7 @@ The first event subset should stay small:
 - `AllReplicasRecovered`
 
 This subset is now replay-checked in Lean under the `lean-core` profile, and
-the reduced proof MVP is in place for that surface.
+the scoped reduced proof is in place for that surface.
 
 `AdvanceMap` is now part of the replay-checked Lean reducer and the current
 supported preservation surface because interval changes and `min_size` logic
@@ -257,7 +258,7 @@ Immediately after that, add prefix-order properties for the explicit PG
 journal.
 
 That reduced invariant layer now exists as executable checks and propositions
-in [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean).
+in [`Peering/Invariants.lean`](Peering/Invariants.lean).
 
 The supported preservation layer now covers:
 
@@ -282,8 +283,9 @@ start snapshot and initialize-headed traces. Checker soundness is now proved
 for `snapshotImageInvariant?`, `snapshotImageClean?`, and
 `snapshotImageRecovering?`, and the replay layer now has an empty-rooted
 theorem that successful supported replay yields theorem-level `ImageInvariant`
-facts on the Lean side. The next proof work is to simplify and broaden that
-replay/refinement story, not to finish the reduced MVP.
+facts on the Lean side. The scoped proof target for this repo is therefore
+complete; further replay/refinement work is optional extension work, not a
+requirement to call the project finished.
 
 ## Replay Strategy
 
@@ -311,7 +313,7 @@ Disagreement handling should follow a soundness-first workflow:
 - classify the mismatch as parser/projection bug, Lean mismatch, C++ bug, or
   spec ambiguity before changing implementations
 
-See [`docs/replay-triage.md`](/home/zhscn/code/peering-lean/docs/replay-triage.md).
+See [`docs/replay-triage.md`](docs/replay-triage.md).
 
 ## Non-Goals
 
@@ -335,9 +337,11 @@ The first successful Lean version should provide:
 - a clean reduced snapshot for replay comparison
 - a path toward trace-level refinement against the C++ implementation
 
-That reduced proof MVP is now achieved. The remaining work is to connect the
-current replay theorem layer into cleaner generic refinement statements and
-then broaden it beyond the current supported replay surface.
+That scoped proof project is now achieved: the repo has a compact semantic
+model, machine-checked image-safety proofs, empty-rooted supported-trace
+preservation, checker soundness, and an initial replay-facing theorem layer for
+the `lean-core` surface. Any further refinement work is an extension, not a
+completion requirement.
 
 The standard is:
 

@@ -176,9 +176,9 @@ This model suggests the following first properties:
 - activation is only allowed when the acting set has a sufficient authoritative
   committed prefix
 
-## Immediate implementation consequence
+## Current implementation consequence
 
-Future Lean work should treat ordering and image state as separate but linked:
+Lean now treats ordering and image state as separate but linked:
 
 - `Types.lean` now has the first compact journal progress and source-aware
   recovery fields
@@ -187,8 +187,16 @@ Future Lean work should treat ordering and image state as separate but linked:
   snapshot/effect boundary
 - `Invariants.lean` now includes the first image-safety and recovery-plan
   invariants as executable checks and propositions
-- the next Lean proof step is widening preservation from the current proved
-  subset (`PeerInfoReceived`, `PeerQueryTimeout`, `AdvanceMap`) to the
-  remaining `lean-core` handlers
+- supported one-step preservation now covers the current `lean-core` proof
+  surface, including `Initialize`, `AdvanceMap`, the primary-side progress
+  handlers, and the replay-driven replica-side handlers under their stated
+  support conditions
+- supported traces from the empty start state now preserve the image-safety
+  invariant
+- successful supported replay now connects back to theorem-level
+  `ImageInvariant` facts on the Lean side
 - replay/refinement should compare a reduced semantic snapshot containing both
   committed prefix progress and derived image state
+
+Broader replay/refinement statements and wider event coverage remain optional
+extension work, not unfinished prerequisites for the current scoped project.

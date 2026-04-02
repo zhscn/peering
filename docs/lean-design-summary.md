@@ -28,7 +28,7 @@ is:
 - a minimal append-only `PGJournal` for ordering
 - an `ObjectImage` for materialized committed state
 
-See [`docs/pg-journal-model.md`](/home/zhscn/code/peering-lean/docs/pg-journal-model.md).
+See [`pg-journal-model.md`](./pg-journal-model.md).
 
 ## Semantic Boundary
 
@@ -55,10 +55,10 @@ results.
 
 The current semantics are defined by the C++ reducer:
 
-- [`peer_info.h`](/home/zhscn/code/peering-lean/cpp/peer_info.h)
-- [`peering_types.h`](/home/zhscn/code/peering-lean/cpp/peering_types.h)
-- [`peering_state.h`](/home/zhscn/code/peering-lean/cpp/peering_state.h)
-- [`peering_state.cc`](/home/zhscn/code/peering-lean/cpp/peering_state.cc)
+- [`peer_info.h`](../cpp/peer_info.h)
+- [`peering_types.h`](../cpp/peering_types.h)
+- [`peering_state.h`](../cpp/peering_state.h)
+- [`peering_state.cc`](../cpp/peering_state.cc)
 
 ### Early exploration / legacy reference
 
@@ -66,8 +66,8 @@ The Idris code and earlier replay work are kept as early exploration and
 historical reference. They are useful for proof structure, but they are not
 maintained as an active semantic model and are not translation targets:
 
-- [`cross_validate.cc`](/home/zhscn/code/peering-lean/cpp/cross_validate.cc)
-- [`docs/idris-reference-notes.md`](/home/zhscn/code/peering-lean/docs/idris-reference-notes.md)
+- [`cross_validate.cc`](../cpp/cross_validate.cc)
+- [`idris-reference-notes.md`](./idris-reference-notes.md)
 
 The main reusable ideas from that earlier exploration are:
 
@@ -113,7 +113,7 @@ decisions:
 - `lastPeeringReset`
 
 That state now exists in executable form in
-[`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean).
+[`Peering/Machine.lean`](../Peering/Machine.lean).
 One implementation detail is now fixed intentionally: `peerInfo` is stored in a
 deterministic `TreeMap`, not a list, so authority-source tie-breaking matches
 the C++ reducer's ordered peer iteration instead of depending on message
@@ -169,7 +169,7 @@ The intended layering is:
 - semantic equality or refinement relation
 
 This matches both the earlier Idris exploration and the current structure of
-[`cross_validate.cc`](/home/zhscn/code/peering-lean/cpp/cross_validate.cc).
+[`cross_validate.cc`](../cpp/cross_validate.cc).
 
 When replay disagrees, the workflow should be soundness-first:
 
@@ -179,18 +179,18 @@ When replay disagrees, the workflow should be soundness-first:
 - classify the issue as parser/projection bug, Lean mismatch, C++ bug, or
   semantic-spec ambiguity
 
-See [`docs/replay-triage.md`](/home/zhscn/code/peering-lean/docs/replay-triage.md).
+See [`replay-triage.md`](./replay-triage.md).
 
 ## Current Lean Status
 
 The repo now has a working Lean scaffold:
 
-- [`Peering/Types.lean`](/home/zhscn/code/peering-lean/Peering/Types.lean)
-- [`Peering/Image.lean`](/home/zhscn/code/peering-lean/Peering/Image.lean)
-- [`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean)
-- [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean)
-- [`Peering/Replay.lean`](/home/zhscn/code/peering-lean/Peering/Replay.lean)
-- [`PeeringReplay.lean`](/home/zhscn/code/peering-lean/PeeringReplay.lean)
+- [`Peering/Types.lean`](../Peering/Types.lean)
+- [`Peering/Image.lean`](../Peering/Image.lean)
+- [`Peering/Machine.lean`](../Peering/Machine.lean)
+- [`Peering/Invariants.lean`](../Peering/Invariants.lean)
+- [`Peering/Replay.lean`](../Peering/Replay.lean)
+- [`PeeringReplay.lean`](../PeeringReplay.lean)
 
 Current coverage:
 
@@ -212,8 +212,12 @@ Current coverage:
   `reduceValidated`, and `step` boundaries for the currently supported subset
 - a first supported trace/reachability layer now exists, including empty-start
   and initialize-headed trace corollaries
+- checker soundness is now proved for `snapshotImageInvariant?`,
+  `snapshotImageClean?`, and `snapshotImageRecovering?`
 - a first structured JSONL replay parser/checker now exists in `Replay.lean`
 - the checked-in `peering-replay` executable validates JSONL traces directly
+- successful supported replay from the empty cursor now yields theorem-level
+  `ImageInvariant` facts on the Lean side
 - basic algebra lemmas are proved
 - the project builds with `lake build`
 - GitHub Actions now runs the C++ trace generator plus Lean replay under the
@@ -226,32 +230,30 @@ Project status:
 - C++ is the executable semantic source of truth
 - Lean is the maintained formalization path
 - Idris is deprecated and kept only as early exploration/reference material
-- the reduced proof MVP is now in place on the current replay-facing semantic
+- the scoped reduced proof project is complete on the current replay-facing
+  semantic surface
+
+Optional extensions:
+
+- stronger reachable-state reasoning beyond explicit supported-trace witnesses
+- cleaner unification between the current replay-facing theorem layer and the
+  generic reachable-state/trace layer
+- broader replay/refinement theorems beyond the current supported replay
   surface
 
-Not implemented yet:
+## Current Conclusion
 
-- refinement statements
-- stronger reachable-state reasoning beyond explicit supported-trace witnesses
-- a cleaner unification between the current replay-facing theorem layer and the
-  generic reachable-state/trace layer
+For the current repo scope, there is no required next proof step. The compact
+append-only peering model, the supported one-step and trace-level safety
+theorems, checker soundness, and the first replay-facing theorem layer are all
+in place.
 
-## Immediate Next Step
+If development resumes, the right direction is extension work rather than
+completion work:
 
-The next step should be:
-
-1. preserve the current replay-facing theorem layer while keeping replay green
-2. fold that theorem layer back into cleaner generic reachable-state
-   statements
-3. broaden replay/refinement theorems beyond the current supported replay
+1. fold the replay-facing theorem layer back into cleaner generic
+   reachable-state statements
+2. broaden replay/refinement theorems beyond the current supported replay
    surface
-
-That keeps the replay workflow soundness-first while moving from the reduced
-proof MVP to replay-facing theorems.
-
-The next proof-facing layer should preserve the current extracted C++ semantic
-surface:
-
-- explicit `authoritativeSeq`
-- source-aware activation
-- source-aware recovery plans
+3. widen the proved surface only when additional C++ paths become
+   caller-critical

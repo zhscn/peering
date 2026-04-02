@@ -131,7 +131,7 @@ Typical outcomes:
 
 The intended toolchain is:
 
-- [`cross_validate.cc`](/home/zhscn/code/peering-lean/cpp/cross_validate.cc)
+- [`cross_validate.cc`](../cpp/cross_validate.cc)
   generates structured before/event/after traces
 - Lean replay parses those traces
 - Lean compares normalized semantic snapshots

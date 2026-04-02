@@ -2,7 +2,7 @@
 
 ## Status
 
-The Idris code in [`idris/`](/home/zhscn/code/peering-lean/idris) is
+The Idris code in [`idris/`](../idris) is
 deprecated as an active model.
 
 It is kept only as:
@@ -42,11 +42,11 @@ Replay and cross-validation should now target Lean, not Idris.
 
 The intended workflow is:
 
-- generate traces from [`cross_validate.cc`](/home/zhscn/code/peering-lean/cpp/cross_validate.cc)
+- generate traces from [`cross_validate.cc`](../cpp/cross_validate.cc)
 - parse them into Lean
 - compare normalized semantic snapshots in Lean against the C++ trace output
 
 Mismatch handling is described in
-[`docs/replay-triage.md`](/home/zhscn/code/peering-lean/docs/replay-triage.md).
+[`replay-triage.md`](./replay-triage.md).
 
 Updating Idris to keep pace with the current C++ reducer is not required.
