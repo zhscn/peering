@@ -16,6 +16,7 @@ from typing import Sequence
 @dataclass
 class RunConfig:
     cycle: int
+    profile: str
     seed: int
     event: int
 
@@ -75,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Fixed cross_validate seed for every cycle. If omitted, each cycle gets a fresh random seed.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("lean-core", "full"),
+        default="lean-core",
+        help="cross_validate event profile to exercise.",
     )
     parser.add_argument(
         "--stop-on-first-failure",
@@ -176,7 +183,7 @@ def run_cycle(
     cross_validate_cmd = [
         str(cross_validate),
         "--profile",
-        "lean-core",
+        config.profile,
         "--seed",
         str(config.seed),
         "--events",
@@ -250,7 +257,7 @@ def report_failures(failures: Sequence[FailureRecord]) -> None:
         print(
             f"- cycle={config.cycle} seed={config.seed} "
             f"event={config.event} "
-            f"profile=lean-core "
+            f"profile={config.profile} "
             f"cross_validate_rc={failure.cross_validate_returncode} "
             f"replayer_rc={failure.replayer_returncode}"
         )
@@ -350,12 +357,13 @@ def main() -> int:
                     break
         config = RunConfig(
             cycle=cycle,
+            profile=args.profile,
             seed=seed,
             event=event,
         )
         print(
             f"[{cycle}/{args.cycles}] "
-            f"seed={config.seed} event={config.event} profile=lean-core",
+            f"seed={config.seed} event={config.event} profile={config.profile}",
             flush=True,
         )
         ok, failure = run_cycle(

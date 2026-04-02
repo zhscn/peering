@@ -34,17 +34,29 @@ jobs:
           lake build
           lake build peering-replay
 
-      - name: Generate replay trace
+      - name: Randomized lean-core replay fuzz
         run: |
-          mkdir -p artifacts
-          ./build/cpp/cross_validate --profile lean-core --seed 1 --events 25 > artifacts/replay.jsonl
+          python3 scripts/replay_fuzz.py \
+            --profile lean-core \
+            --cycles 128 \
+            --event-range 32 512 \
+            --stop-on-first-failure \
+            --save-failure-traces artifacts/lean-core-fuzz \
+            --require-cpp-image-invariant
 
-      - name: Replay trace in Lean
-        run: ./.lake/build/bin/peering-replay artifacts/replay.jsonl
+      - name: Randomized full-profile replay fuzz
+        run: |
+          python3 scripts/replay_fuzz.py \
+            --profile full \
+            --cycles 8 \
+            --event-range 32 512 \
+            --stop-on-first-failure \
+            --save-failure-traces artifacts/full-fuzz
 
-      - name: Upload replay trace
-        if: always()
+      - name: Upload replay artifacts
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: replay-trace
-          path: artifacts/replay.jsonl
+          name: replay-artifacts
+          path: artifacts
+          retention-days: 3
