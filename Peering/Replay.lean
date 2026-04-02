@@ -1,6 +1,6 @@
 import Lean.Data.Json
 import Lean.Data.Json.Parser
-import Peering.Machine
+import Peering.Invariants
 
 open Lean
 
@@ -11,7 +11,7 @@ structure SnapshotChecks where
   imageInvariant : Bool
   imageClean : Bool
   imageRecovering : Bool
-  deriving Repr
+  deriving DecidableEq, Repr
 
 structure ReplayStep where
   step : Nat
@@ -94,6 +94,12 @@ def normalizeSnapshot (snap : Snapshot) : Snapshot :=
     localRecoveryPlan := snap.localRecoveryPlan.map normalizeObjRecovery
     recovered := normalizeByRepr snap.recovered
     timedOutProbes := normalizeByRepr snap.timedOutProbes }
+
+def computeSnapshotChecks (snap : Snapshot) : SnapshotChecks :=
+  { haveEnoughInfo := haveEnoughInfo snap
+    imageInvariant := snapshotImageInvariant? snap
+    imageClean := snapshotImageClean? snap
+    imageRecovering := snapshotImageRecovering? snap }
 
 def parseStateName (name : String) : Except String State :=
   match name with
@@ -440,12 +446,18 @@ def compareReplayStep (expected : ReplayStep) (actual : SnapshotStepResult) : Ex
   let actualBefore := normalizeSnapshot actual.before
   if reprStr actualBefore ≠ reprStr expectedBefore then
     throw s!"before snapshot mismatch at step {expected.step}\nexpected: {reprStr expectedBefore}\nactual: {reprStr actualBefore}"
+  let actualBeforeChecks := computeSnapshotChecks actualBefore
+  if actualBeforeChecks ≠ expected.beforeChecks then
+    throw s!"before checks mismatch at step {expected.step}\nexpected: {reprStr expected.beforeChecks}\nactual: {reprStr actualBeforeChecks}"
   if actual.fromState ≠ expected.fromState then
     throw s!"from-state mismatch at step {expected.step}\nexpected: {reprStr expected.fromState}\nactual: {reprStr actual.fromState}"
   let expectedAfter := normalizeSnapshot expected.after
   let actualAfter := normalizeSnapshot actual.after
   if reprStr actualAfter ≠ reprStr expectedAfter then
     throw s!"after snapshot mismatch at step {expected.step}\nexpected: {reprStr expectedAfter}\nactual: {reprStr actualAfter}"
+  let actualAfterChecks := computeSnapshotChecks actualAfter
+  if actualAfterChecks ≠ expected.afterChecks then
+    throw s!"after checks mismatch at step {expected.step}\nexpected: {reprStr expected.afterChecks}\nactual: {reprStr actualAfterChecks}"
   if actual.toState ≠ expected.toState then
     throw s!"to-state mismatch at step {expected.step}\nexpected: {reprStr expected.toState}\nactual: {reprStr actual.toState}"
   let expectedEffects := normalizeEffects expected.effects
@@ -462,15 +474,16 @@ def replayObservedStep (cursor : ReplayCursor) (entry : ReplayStep) : Except Str
   compareReplayStep entry actual
   pure { current := normalizeSnapshot actual.after }
 
-def replayLines (lines : List ReplayLine) : Except String ReplayCursor := do
-  lines.foldlM
-    (fun cursor line =>
-      match line with
-      | .step item =>
-          replayObservedStep cursor item
-      | .summary _ =>
-          pure cursor)
-    {}
+def replayLinesFrom (cursor : ReplayCursor) : List ReplayLine -> Except String ReplayCursor
+  | [] => pure cursor
+  | .step item :: lines => do
+      let cursor ← replayObservedStep cursor item
+      replayLinesFrom cursor lines
+  | .summary _ :: lines =>
+      replayLinesFrom cursor lines
+
+def replayLines (lines : List ReplayLine) : Except String ReplayCursor :=
+  replayLinesFrom {} lines
 
 def replayStats (lines : List ReplayLine) : ReplayStats :=
   lines.foldl
@@ -484,5 +497,171 @@ def replayTrace (input : String) : Except String (ReplayStats × ReplayCursor) :
   let lines ← parseReplayLines input
   let cursor ← replayLines lines
   pure (replayStats lines, cursor)
+
+theorem compareReplayStep_ok_afterChecks
+    (expected : ReplayStep) (actual : SnapshotStepResult)
+    (h : compareReplayStep expected actual = .ok ()) :
+    computeSnapshotChecks (normalizeSnapshot actual.after) = expected.afterChecks := by
+  unfold compareReplayStep at h
+  by_cases hBefore :
+      reprStr (normalizeSnapshot actual.before) =
+        reprStr (normalizeSnapshot expected.before)
+  · simp [hBefore] at h
+    by_cases hBeforeChecks :
+        computeSnapshotChecks (normalizeSnapshot actual.before) = expected.beforeChecks
+    · simp [hBeforeChecks] at h
+      by_cases hFrom : actual.fromState = expected.fromState
+      · simp [hFrom] at h
+        by_cases hAfter :
+            reprStr (normalizeSnapshot actual.after) =
+              reprStr (normalizeSnapshot expected.after)
+        · simp [hAfter] at h
+          by_cases hAfterChecks :
+              computeSnapshotChecks (normalizeSnapshot actual.after) = expected.afterChecks
+          · exact hAfterChecks
+          · simp [hAfterChecks] at h
+            cases h
+        · simp [hAfter] at h
+          cases h
+      · simp [hFrom] at h
+        cases h
+    · simp [hBeforeChecks] at h
+      cases h
+  · simp [hBefore] at h
+    cases h
+
+theorem replayObservedStep_ok_compare
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (h : replayObservedStep cursor entry = .ok cursor') :
+    compareReplayStep entry (step cursor.current entry.event) = .ok () := by
+  unfold replayObservedStep at h
+  by_cases hBefore :
+      reprStr (normalizeSnapshot cursor.current) =
+        reprStr (normalizeSnapshot entry.before)
+  · simp [hBefore] at h
+    cases hCompare : compareReplayStep entry (step cursor.current entry.event) with
+    | error err =>
+        simp [hCompare] at h
+        cases h
+    | ok result =>
+        cases result
+        rfl
+  · simp [hBefore] at h
+    cases h
+
+theorem replayObservedStep_ok_current
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (h : replayObservedStep cursor entry = .ok cursor') :
+    cursor'.current = normalizeSnapshot (step cursor.current entry.event).after := by
+  unfold replayObservedStep at h
+  by_cases hBefore :
+      reprStr (normalizeSnapshot cursor.current) =
+        reprStr (normalizeSnapshot entry.before)
+  · simp [hBefore] at h
+    cases hCompare : compareReplayStep entry (step cursor.current entry.event) with
+    | error err =>
+        simp [hCompare] at h
+        cases h
+    | ok result =>
+        cases result
+        simp [hCompare] at h
+        cases h
+        rfl
+  · simp [hBefore] at h
+    cases h
+
+theorem replayObservedStep_ok_afterChecks
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (h : replayObservedStep cursor entry = .ok cursor') :
+    computeSnapshotChecks cursor'.current = entry.afterChecks := by
+  have hCurrent := replayObservedStep_ok_current cursor entry cursor' h
+  have hCompare := replayObservedStep_ok_compare cursor entry cursor' h
+  simpa [hCurrent] using
+    compareReplayStep_ok_afterChecks entry (step cursor.current entry.event) hCompare
+
+theorem imageInvariant_of_replayObservedStep_after_check
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (hReplay : replayObservedStep cursor entry = .ok cursor')
+    (hCheck : entry.afterChecks.imageInvariant = true) :
+    ImageInvariant cursor'.current := by
+  have hAfterChecks := replayObservedStep_ok_afterChecks cursor entry cursor' hReplay
+  rw [← hAfterChecks] at hCheck
+  exact snapshotImageInvariant?_implies_imageInvariant cursor'.current (by
+    simpa [computeSnapshotChecks] using hCheck)
+
+theorem imageClean_of_replayObservedStep_after_check
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (hReplay : replayObservedStep cursor entry = .ok cursor')
+    (hCheck : entry.afterChecks.imageClean = true) :
+    ImageClean cursor'.current := by
+  have hAfterChecks := replayObservedStep_ok_afterChecks cursor entry cursor' hReplay
+  rw [← hAfterChecks] at hCheck
+  exact snapshotImageClean?_implies_imageClean cursor'.current (by
+    simpa [computeSnapshotChecks] using hCheck)
+
+theorem imageRecovering_of_replayObservedStep_after_check
+    (cursor : ReplayCursor) (entry : ReplayStep) (cursor' : ReplayCursor)
+    (hReplay : replayObservedStep cursor entry = .ok cursor')
+    (hCheck : entry.afterChecks.imageRecovering = true) :
+    ImageRecovering cursor'.current := by
+  have hAfterChecks := replayObservedStep_ok_afterChecks cursor entry cursor' hReplay
+  rw [← hAfterChecks] at hCheck
+  exact snapshotImageRecovering?_implies_imageRecovering cursor'.current (by
+    simpa [computeSnapshotChecks] using hCheck)
+
+inductive ReplayLinesImageInvariantSupported : ReplayCursor -> List ReplayLine -> Prop where
+  | nil (cursor : ReplayCursor) :
+      ReplayLinesImageInvariantSupported cursor []
+  | summary (cursor : ReplayCursor) (line : ReplaySummary) (lines : List ReplayLine)
+      (hTail : ReplayLinesImageInvariantSupported cursor lines) :
+      ReplayLinesImageInvariantSupported cursor (.summary line :: lines)
+  | step (cursor : ReplayCursor) (line : ReplayStep) (lines : List ReplayLine)
+      (hHead : imageInvariantStepSupported cursor.current line.event)
+      (hCheck : line.afterChecks.imageInvariant = true)
+      (hTail :
+        ReplayLinesImageInvariantSupported
+          { current := normalizeSnapshot (step cursor.current line.event).after }
+          lines) :
+      ReplayLinesImageInvariantSupported cursor (.step line :: lines)
+
+theorem imageInvariant_of_replayLinesFrom_supported
+    (start cursor : ReplayCursor) (lines : List ReplayLine)
+    (hStart : ImageInvariant start.current)
+    (hReplay : replayLinesFrom start lines = .ok cursor)
+    (hSupported : ReplayLinesImageInvariantSupported start lines) :
+    ImageInvariant cursor.current := by
+  induction hSupported generalizing cursor with
+  | nil start =>
+      simp [replayLinesFrom] at hReplay
+      cases hReplay
+      simpa using hStart
+  | summary start line lines hTail ih =>
+      simp [replayLinesFrom] at hReplay
+      exact ih cursor hStart hReplay
+  | step start line lines hHead hCheck hTail ih =>
+      cases hStep : replayObservedStep start line with
+      | error err =>
+          simp [replayLinesFrom, hStep] at hReplay
+          cases hReplay
+      | ok mid =>
+          simp [replayLinesFrom, hStep] at hReplay
+          have hMidInv :
+              ImageInvariant mid.current :=
+            imageInvariant_of_replayObservedStep_after_check start line mid hStep hCheck
+          have hMidEq :
+              mid =
+                { current := normalizeSnapshot (step start.current line.event).after } := by
+            cases mid
+            simp [ReplayCursor.mk.injEq]
+            exact replayObservedStep_ok_current start line _ hStep
+          rw [hMidEq] at hReplay
+          exact ih cursor (by simpa [hMidEq] using hMidInv) hReplay
+
+theorem imageInvariant_of_replayLines_supported
+    (lines : List ReplayLine) (cursor : ReplayCursor)
+    (hReplay : replayLines lines = .ok cursor)
+    (hSupported : ReplayLinesImageInvariantSupported {} lines) :
+    ImageInvariant cursor.current := by
+  exact imageInvariant_of_replayLinesFrom_supported {} cursor lines imageInvariant_empty hReplay hSupported
 
 end Peering

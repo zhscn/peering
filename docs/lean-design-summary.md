@@ -231,20 +231,20 @@ Project status:
 
 Not implemented yet:
 
-- checker-soundness theorems from executable invariant checks back to Lean
-  propositions
 - refinement statements
 - stronger reachable-state reasoning beyond explicit supported-trace witnesses
+- a cleaner unification between the current replay-facing theorem layer and the
+  generic reachable-state/trace layer
 
 ## Immediate Next Step
 
 The next step should be:
 
-1. prove soundness of the executable invariant checks back to the proposition
-   layer
-2. use that to connect replay observations directly to the proof-facing
-   invariant surface
-3. start replay/refinement theorems on top of the supported trace layer
+1. preserve the current replay-facing theorem layer while keeping replay green
+2. fold that theorem layer back into cleaner generic reachable-state
+   statements
+3. broaden replay/refinement theorems beyond the current supported replay
+   surface
 
 That keeps the replay workflow soundness-first while moving from the reduced
 proof MVP to replay-facing theorems.

@@ -167,20 +167,19 @@ Idris status:
 
 ### In progress
 
-- proving soundness bridges from executable replay/check booleans back to Lean
-  propositions, especially for `snapshotImageInvariant?`
-- lifting the supported trace layer into cleaner replay-facing reachable-state
-  statements
-- starting the first replay/refinement theorems on top of the current supported
-  reducer and trace surface
+- lifting the current replay-facing theorem layer into cleaner generic
+  reachable-state/refinement statements
+- reducing duplication between replay-supported traces and the generic
+  `step`/reachable-state surface
+- broadening replay/refinement statements beyond the current supported event
+  surface and invariant-ok replay traces
 
 ### Not done yet
 
-- checker-soundness theorems from executable invariant checks back to
-  proof-facing propositions
 - stronger reachable-state reasoning that is not phrased through explicit
   supported-trace witnesses
-- refinement/simulation theorems
+- unrestricted refinement/simulation theorems beyond the current supported
+  replay surface
 
 ## Lean Scope Right Now
 
@@ -204,11 +203,12 @@ The next concrete milestone is:
 
 - keep replay green on the current reduced semantic projection, including
   `AdvanceMap`
-- prove soundness of the executable invariant checks back to
-  `ImageInvariant`
 - preserve the theorem surface at the handler, `reduceValidated`, `step`, and
   supported-trace boundaries
-- start replay/refinement lemmas on top of the supported trace layer
+- preserve the new replay-facing theorem layer that connects successful replay
+  to theorem-level invariants
+- fold that replay theorem layer back into cleaner generic
+  reachable-state/refinement statements
 
 The first event subset should stay small:
 
@@ -278,9 +278,12 @@ support conditions:
 
 That surface is lifted through the handler, `reduceValidated`, and `step`
 boundaries, and now also through supported trace execution from both the empty
-start snapshot and initialize-headed traces. The next proof work is no longer
-finishing the reduced MVP; it is proving checker soundness and beginning the
-replay/refinement layer.
+start snapshot and initialize-headed traces. Checker soundness is now proved
+for `snapshotImageInvariant?`, `snapshotImageClean?`, and
+`snapshotImageRecovering?`, and the replay layer now has an empty-rooted
+theorem that successful supported replay yields theorem-level `ImageInvariant`
+facts on the Lean side. The next proof work is to simplify and broaden that
+replay/refinement story, not to finish the reduced MVP.
 
 ## Replay Strategy
 
@@ -333,8 +336,8 @@ The first successful Lean version should provide:
 - a path toward trace-level refinement against the C++ implementation
 
 That reduced proof MVP is now achieved. The remaining work is to connect the
-executable checks back to the propositions cleanly and then lift the current
-proof surface into replay/refinement theorems.
+current replay theorem layer into cleaner generic refinement statements and
+then broaden it beyond the current supported replay surface.
 
 The standard is:
 

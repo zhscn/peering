@@ -185,6 +185,119 @@ theorem prefixImage?_refl (image : ObjectImage) :
   intro obj hMem
   simp
 
+theorem boolAnd_cons (x : Bool) (xs : List Bool) :
+    boolAnd (x :: xs) = (x && boolAnd xs) := by
+  cases x with
+  | false =>
+      simp [boolAnd]
+      induction xs with
+      | nil =>
+          simp
+      | cons y ys ih =>
+          simpa using ih
+  | true =>
+      simp [boolAnd]
+
+theorem boolAnd_eq_true_iff (xs : List Bool) :
+    boolAnd xs = true ↔ ∀ b ∈ xs, b = true := by
+  induction xs with
+  | nil =>
+      simp [boolAnd]
+  | cons x xs ih =>
+      rw [boolAnd_cons]
+      simp [Bool.and_eq_true, ih]
+
+theorem eq_true_of_mem_boolAnd {xs : List Bool} (h : boolAnd xs = true)
+    {b : Bool} (hMem : b ∈ xs) :
+    b = true := by
+  exact (boolAnd_eq_true_iff xs).1 h b hMem
+
+theorem sameImage_of_sameImage? (lhs rhs : ObjectImage) :
+    sameImage? lhs rhs = true → sameImage lhs rhs := by
+  intro h
+  unfold sameImage? at h
+  simp [Bool.and_eq_true] at h
+  exact ⟨prefixImage_of_prefixImage? _ _ h.1, prefixImage_of_prefixImage? _ _ h.2⟩
+
+theorem authorityEntryBackedByKnownPeer_of_check (knownPeers : List PeerInfo)
+    (entry : ObjectId × ObjectAuthority) :
+    authorityEntryBackedByKnownPeer? knownPeers entry = true →
+      authorityEntryBackedByKnownPeer knownPeers entry := by
+  intro h
+  unfold authorityEntryBackedByKnownPeer? at h
+  unfold authorityEntryBackedByKnownPeer
+  rw [List.any_eq_true] at h
+  rcases h with ⟨peer, hMem, hEq⟩
+  refine ⟨peer, hMem, ?_⟩
+  exact (decide_eq_true_eq.mp hEq)
+
+theorem authSourcesBackedByKnownPeers_of_check (snap : Snapshot) :
+    authSourcesBackedByKnownPeers? snap = true →
+      authSourcesBackedByKnownPeers snap := by
+  intro h
+  unfold authSourcesBackedByKnownPeers? at h
+  unfold authSourcesBackedByKnownPeers
+  have hAll := List.all_eq_true.mp h
+  intro entry hEntry
+  exact authorityEntryBackedByKnownPeer_of_check _ _ (hAll entry hEntry)
+
+theorem actingReplicaWithinAuthority_of_check (snap : Snapshot) :
+    actingReplicaWithinAuthority? snap = true →
+      actingReplicaWithinAuthority snap := by
+  intro h
+  unfold actingReplicaWithinAuthority? at h
+  unfold actingReplicaWithinAuthority
+  intro peer hPeer
+  let check :=
+    decide (peer.committedSeq ≤ snap.authSeq) &&
+      prefixImage? (effectivePeerImage peer) snap.authImage
+  have hCheckMem :
+      check ∈ (actingReplicaImages snap).map (fun peer =>
+        decide (peer.committedSeq ≤ snap.authSeq) &&
+          prefixImage? (effectivePeerImage peer) snap.authImage) := by
+    simpa [check] using
+      (List.mem_map_of_mem
+        (f := fun peer =>
+          decide (peer.committedSeq ≤ snap.authSeq) &&
+            prefixImage? (effectivePeerImage peer) snap.authImage)
+        hPeer)
+  have hCheck : check = true := eq_true_of_mem_boolAnd h hCheckMem
+  have hParts :
+      decide (peer.committedSeq ≤ snap.authSeq) = true ∧
+        prefixImage? (effectivePeerImage peer) snap.authImage = true := by
+    simpa [check] using hCheck
+  refine ⟨decide_eq_true_eq.mp hParts.1, prefixImage_of_prefixImage? _ _ hParts.2⟩
+
+theorem snapshotImageInvariant?_implies_imageInvariant (snap : Snapshot) :
+    snapshotImageInvariant? snap = true → ImageInvariant snap := by
+  intro h
+  unfold snapshotImageInvariant? at h
+  simp at h
+  have hLocalPlan := h.2
+  have h := h.1
+  have hPeerPlans := h.2
+  have h := h.1
+  have hActing := h.2
+  have h := h.1
+  have hLocalPrefix := h.2
+  have h := h.1
+  have hLocalSeq := h.2
+  have h := h.1
+  have hAuthSources := h.2
+  have h := h.1
+  have hAuthSeq := h.2
+  have h := h.1
+  have hAuthImage := h.2
+  have hBacked := h.1
+  refine ⟨?_, ?_, hAuthSeq, ?_, ?_, ?_, ?_, ?_⟩
+  · exact authSourcesBackedByKnownPeers_of_check snap hBacked
+  · exact sameImage_of_sameImage? _ _ hAuthImage
+  · exact sameImage_of_sameImage? _ _ hAuthSources
+  · exact ⟨hLocalSeq, prefixImage_of_prefixImage? _ _ hLocalPrefix⟩
+  · exact actingReplicaWithinAuthority_of_check snap hActing
+  · simpa [peerRecoveryPlansMatchAuthority?, peerRecoveryPlansMatchAuthority] using hPeerPlans
+  · simpa [localRecoveryPlanMatchesAuthority?, localRecoveryPlanMatchesAuthority] using hLocalPlan
+
 theorem snapshotImageClean?_implies_invariant_check (snap : Snapshot) :
     snapshotImageClean? snap = true → snapshotImageInvariant? snap = true := by
   intro h
@@ -199,6 +312,71 @@ theorem snapshotImageRecovering?_implies_invariant_check (snap : Snapshot) :
   unfold snapshotImageRecovering? at h
   simp at h
   exact h.left.left
+
+theorem snapshotImageClean?_implies_imageClean (snap : Snapshot) :
+    snapshotImageClean? snap = true → ImageClean snap := by
+  intro h
+  have hInvariantCheck := snapshotImageClean?_implies_invariant_check snap h
+  have hInvariant := snapshotImageInvariant?_implies_imageInvariant snap hInvariantCheck
+  unfold snapshotImageClean? at h
+  rw [hInvariantCheck] at h
+  simp at h
+  rcases h with ⟨⟨hPeerPlans, hLocalPlan⟩, ⟨⟨hLocalSeq, hLocalImage⟩, hReplicaChecks⟩⟩
+  refine ⟨hInvariant, hPeerPlans, hLocalPlan, hLocalSeq,
+    sameImage_of_sameImage? _ _ hLocalImage, ?_⟩
+  intro peer hPeer
+  let check :=
+    decide (snap.authSeq ≤ peer.committedSeq) &&
+      sameImage? (effectivePeerImage peer) snap.authImage
+  have hCheckMem :
+      check ∈ (actingReplicaImages snap).map (fun peer =>
+        decide (snap.authSeq ≤ peer.committedSeq) &&
+          sameImage? (effectivePeerImage peer) snap.authImage) := by
+    simpa [check] using
+      (List.mem_map_of_mem
+        (f := fun peer =>
+          decide (snap.authSeq ≤ peer.committedSeq) &&
+            sameImage? (effectivePeerImage peer) snap.authImage)
+        hPeer)
+  have hCheck : check = true := eq_true_of_mem_boolAnd hReplicaChecks hCheckMem
+  have hParts :
+      decide (snap.authSeq ≤ peer.committedSeq) = true ∧
+        sameImage? (effectivePeerImage peer) snap.authImage = true := by
+    simpa [check] using hCheck
+  exact ⟨decide_eq_true_eq.mp hParts.1, sameImage_of_sameImage? _ _ hParts.2⟩
+
+theorem snapshotImageRecovering?_implies_imageRecovering (snap : Snapshot) :
+    snapshotImageRecovering? snap = true → ImageRecovering snap := by
+  intro h
+  have hInvariantCheck := snapshotImageRecovering?_implies_invariant_check snap h
+  have hInvariant := snapshotImageInvariant?_implies_imageInvariant snap hInvariantCheck
+  unfold snapshotImageRecovering? at h
+  simp at h
+  rcases h with ⟨⟨_, _⟩, hReason⟩
+  have hNotClean : ¬ ImageClean snap := by
+    intro hClean
+    rcases hClean with ⟨_, hPeerPlans, hLocalPlan, hLocalSeq, _, hPeerSeqs⟩
+    rcases hReason with hReason | hPeerLag
+    · rcases hReason with hPlans | hLocalLag
+      · rcases hPlans with hPeerPlansNe | hLocalPlanNe
+        · exact hPeerPlansNe hPeerPlans
+        · exact hLocalPlanNe hLocalPlan
+      · exact Nat.not_lt_of_ge hLocalSeq hLocalLag
+    · rcases hPeerLag with ⟨peer, hPeerMem, hPeerLag⟩
+      exact Nat.not_lt_of_ge (hPeerSeqs peer hPeerMem).1 hPeerLag
+  have hWitness :
+      snap.peerRecoveryPlans ≠ [] ∨
+        snap.localRecoveryPlan ≠ [] ∨
+        snap.localInfo.committedSeq < snap.authSeq ∨
+        ∃ peer ∈ actingReplicaImages snap, peer.committedSeq < snap.authSeq := by
+    rcases hReason with hReason | hPeerLag
+    · rcases hReason with hPlans | hLocalLag
+      · rcases hPlans with hPeerPlansNe | hLocalPlanNe
+        · exact Or.inl hPeerPlansNe
+        · exact Or.inr (Or.inl hLocalPlanNe)
+      · exact Or.inr (Or.inr (Or.inl hLocalLag))
+    · exact Or.inr (Or.inr (Or.inr hPeerLag))
+  exact ⟨hInvariant, hNotClean, hWitness⟩
 
 theorem authoritativeSources_knownPeerImages_empty :
     authoritativeSources (knownPeerImages ({} : Snapshot)) = ({} : AuthorityImage) := by
