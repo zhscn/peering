@@ -202,10 +202,16 @@ Current coverage:
 - the reducer now uses a deterministic map-backed `peerInfo` representation
   instead of list-order semantics
 - a first explicit invariant layer now exists in `Invariants.lean`
-- one-step preservation theorems now exist for `PeerInfoReceived`,
-  `PeerQueryTimeout`, and `AdvanceMap`
+- one-step preservation theorems now exist for `Initialize`,
+  `PeerInfoReceived`, `PeerQueryTimeout`, `UpThruUpdated`,
+  `ActivateCommitted`, `RecoveryComplete`, `AllReplicasRecovered`, and
+  `AdvanceMap`
+- snapshot-sensitive one-step preservation now exists for
+  `ReplicaActivate` and `ReplicaRecoveryComplete`
 - those preservation results are lifted through the handler,
   `reduceValidated`, and `step` boundaries for the currently supported subset
+- a first supported trace/reachability layer now exists, including empty-start
+  and initialize-headed trace corollaries
 - a first structured JSONL replay parser/checker now exists in `Replay.lean`
 - the checked-in `peering-replay` executable validates JSONL traces directly
 - basic algebra lemmas are proved
@@ -220,26 +226,28 @@ Project status:
 - C++ is the executable semantic source of truth
 - Lean is the maintained formalization path
 - Idris is deprecated and kept only as early exploration/reference material
+- the reduced proof MVP is now in place on the current replay-facing semantic
+  surface
 
 Not implemented yet:
 
+- checker-soundness theorems from executable invariant checks back to Lean
+  propositions
 - refinement statements
-- one-step preservation proofs for the remaining `lean-core` handlers
-- stronger theorem support for reachable-state reasoning
+- stronger reachable-state reasoning beyond explicit supported-trace witnesses
 
 ## Immediate Next Step
 
 The next step should be:
 
-1. extend one-step preservation from the current proved subset to the rest of
-   the `lean-core` handlers
-2. keep that theorem surface aligned at the handler, `reduceValidated`, and
-   `step` boundaries
-3. start the first reachable-state / trace-level layer once the reduced event
-   subset is covered
+1. prove soundness of the executable invariant checks back to the proposition
+   layer
+2. use that to connect replay observations directly to the proof-facing
+   invariant surface
+3. start replay/refinement theorems on top of the supported trace layer
 
-That keeps the replay workflow soundness-first while widening the proof surface
-from the first landed preservation results to the whole reduced reducer slice.
+That keeps the replay workflow soundness-first while moving from the reduced
+proof MVP to replay-facing theorems.
 
 The next proof-facing layer should preserve the current extracted C++ semantic
 surface:

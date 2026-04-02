@@ -641,7 +641,6 @@ def onRecoveryComplete (snap : Snapshot) (e : Event.RecoveryComplete) :
     (snap, [])
   else
     let completed := osdSetInsert snap.recovered e.peer
-    let clean := osdSetEq completed (imageRecoveryTargets snap)
     let peerInfo :=
       upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
     let localInfo :=
@@ -654,11 +653,11 @@ def onRecoveryComplete (snap : Snapshot) (e : Event.RecoveryComplete) :
         }
       else
         snap.localInfo
-    let snap := refreshRecoveryPlansFromCurrentAuthority {
+    let snap := refreshImageStateFromKnownPeers {
       snap with peerInfo := peerInfo, localInfo := localInfo, recovered := completed
     }
-    if clean then
-      let snap := { snap with peerRecoveryPlans := [], localRecoveryPlan := [], recovered := [] }
+    if (imageRecoveryTargets snap).isEmpty then
+      let snap := { snap with recovered := [] }
       let (snap, fx) := transitionTo snap .clean "all replicas recovered"
       (snap, fx ++ [.markClean { pgid := snap.pgid }, effectPersist snap, effectPublishStats snap])
     else
@@ -688,19 +687,18 @@ def onAllReplicasRecovered (snap : Snapshot) (e : Event.AllReplicasRecovered) :
           committedSeq := snap.authSeq
           committedLength := primaryLength snap.authImage
       }
-      let snap := {
-        refreshRecoveryPlansFromCurrentAuthority {
-          snap with
-            peerInfo := peerInfo
-            localInfo := localInfo
-            recovered := completed
-        } with
-        peerRecoveryPlans := []
-        localRecoveryPlan := []
-        recovered := []
+      let snap := refreshImageStateFromKnownPeers {
+        snap with
+          peerInfo := peerInfo
+          localInfo := localInfo
+          recovered := completed
       }
-      let (snap, fx) := transitionTo snap .clean "all replicas recovered (batch)"
-      (snap, fx ++ [.markClean { pgid := snap.pgid }, effectPersist snap, effectPublishStats snap])
+      if (imageRecoveryTargets snap).isEmpty then
+        let snap := { snap with recovered := [] }
+        let (snap, fx) := transitionTo snap .clean "all replicas recovered (batch)"
+        (snap, fx ++ [.markClean { pgid := snap.pgid }, effectPersist snap, effectPublishStats snap])
+      else
+        (snap, [])
 
 def onReplicaActivate (snap : Snapshot) (e : Event.ReplicaActivate) :
     Snapshot × List PeeringEffect :=
@@ -951,5 +949,13 @@ def step (snapshot : Snapshot) (event : PeeringEvent) : SnapshotStepResult :=
         toState := snapshot.state
         effects := []
       }
+
+def reduceValidatedTrace (snapshot : Snapshot) : List ValidatedEvent -> Snapshot
+  | [] => snapshot
+  | event :: events => reduceValidatedTrace (reduceValidated snapshot event).1 events
+
+def stepTrace (snapshot : Snapshot) : List PeeringEvent -> Snapshot
+  | [] => snapshot
+  | event :: events => stepTrace (step snapshot event).after events
 
 end Peering

@@ -178,6 +178,13 @@ theorem prefixImage_of_prefixImage? (lhs rhs : ObjectImage) :
   · have hZero : lookupLength lhs obj = 0 := Nat.eq_zero_of_not_pos hPos
     simp [hZero]
 
+theorem prefixImage?_refl (image : ObjectImage) :
+    prefixImage? image image = true := by
+  unfold prefixImage?
+  apply List.all_eq_true.mpr
+  intro obj hMem
+  simp
+
 theorem snapshotImageClean?_implies_invariant_check (snap : Snapshot) :
     snapshotImageClean? snap = true → snapshotImageInvariant? snap = true := by
   intro h
@@ -192,6 +199,62 @@ theorem snapshotImageRecovering?_implies_invariant_check (snap : Snapshot) :
   unfold snapshotImageRecovering? at h
   simp at h
   exact h.left.left
+
+theorem authoritativeSources_knownPeerImages_empty :
+    authoritativeSources (knownPeerImages ({} : Snapshot)) = ({} : AuthorityImage) := by
+  native_decide
+
+theorem authorityImageValues_authoritativeSources_knownPeerImages_empty :
+    authorityImageValues (authoritativeSources (knownPeerImages ({} : Snapshot))) =
+      ({} : ObjectImage) := by
+  native_decide
+
+theorem authoritativeCommittedSeq_knownPeerImages_empty :
+    authoritativeCommittedSeq (knownPeerImages ({} : Snapshot)) = 0 := by
+  native_decide
+
+theorem actingReplicaImages_empty :
+    actingReplicaImages ({} : Snapshot) = [] := by
+  native_decide
+
+theorem buildPeerRecoveryPlans_empty :
+    buildPeerRecoveryPlans
+        (authoritativeSources (knownPeerImages ({} : Snapshot)))
+        (authoritativeCommittedSeq (knownPeerImages ({} : Snapshot)))
+        (actingReplicaImages ({} : Snapshot)) =
+      [] := by
+  native_decide
+
+theorem pgImageRecoveryPlan_empty :
+    pgImageRecoveryPlan
+        (authoritativeSources (knownPeerImages ({} : Snapshot)))
+        ({} : PGInfo) =
+      [] := by
+  native_decide
+
+theorem imageInvariant_empty : ImageInvariant ({} : Snapshot) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro entry hEntry
+    simp at hEntry
+  · unfold authImageMatchesKnownPeers
+    rw [authorityImageValues_authoritativeSources_knownPeerImages_empty]
+    simpa using sameImage_refl ({} : ObjectImage)
+  · unfold authSeqMatchesKnownPeers
+    exact authoritativeCommittedSeq_knownPeerImages_empty
+  · unfold authSourcesMatchKnownPeers
+    rw [authorityImageValues_authoritativeSources_knownPeerImages_empty]
+    simpa using sameImage_refl ({} : ObjectImage)
+  · constructor
+    · simp
+    · intro obj
+      simp [effectivePGImage, lookupLength, lookupLengthEntries]
+  · intro peer hPeer
+    rw [actingReplicaImages_empty] at hPeer
+    cases hPeer
+  · unfold peerRecoveryPlansMatchAuthority
+    rw [buildPeerRecoveryPlans_empty]
+  · unfold localRecoveryPlanMatchesAuthority
+    exact pgImageRecoveryPlan_empty
 
 private def eraseDupsIdem {α} [BEq α] [LawfulBEq α] :
     (xs : List α) → xs.eraseDups.eraseDups = xs.eraseDups
@@ -408,15 +471,67 @@ theorem authImage_eq_authorityImageValues_refreshAuthorityFromKnownPeers
       authorityImageValues (authoritativeSources (knownPeerImages snap)) := by
   simp [refreshAuthorityFromKnownPeers]
 
+def localKnownPeer (whoami : OsdId) (localInfo : PGInfo) : PeerInfo :=
+  { osd := whoami
+    committedSeq := (normalizedPGInfo localInfo).committedSeq
+    committedLength := (normalizedPGInfo localInfo).committedLength
+    image := (normalizedPGInfo localInfo).image
+    lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
+    lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted
+  }
+
+theorem effectivePeerImage_localKnownPeer
+    (whoami : OsdId) (localInfo : PGInfo) :
+    effectivePeerImage (localKnownPeer whoami localInfo) = effectivePGImage localInfo := by
+  let image := effectivePGImage localInfo
+  change effectivePeerImage
+      { osd := whoami
+        committedSeq := (normalizedPGInfo localInfo).committedSeq
+        committedLength := primaryLength image
+        image := image
+        lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
+        lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted } = image
+  by_cases h : image.entries = []
+  · have hLen : primaryLength image = 0 := by
+      simp [primaryLength, lookupLength, lookupLengthEntries, h, image]
+    simp [effectivePeerImage, h, hLen]
+  · simp [effectivePeerImage, h]
+
+theorem authorityFromPeerInfo_localKnownPeer
+    (whoami : OsdId) (localInfo : PGInfo) :
+    authorityFromPeerInfo (localKnownPeer whoami localInfo) =
+      authorityFromImage whoami (effectivePGImage localInfo) := by
+  unfold authorityFromPeerInfo localKnownPeer
+  have hEq :
+      effectivePeerImage
+        { osd := whoami
+          committedSeq := (normalizedPGInfo localInfo).committedSeq
+          committedLength := (normalizedPGInfo localInfo).committedLength
+          image := (normalizedPGInfo localInfo).image
+          lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
+          lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted } =
+        effectivePGImage localInfo := by
+    simpa [localKnownPeer] using effectivePeerImage_localKnownPeer whoami localInfo
+  simpa [normalizedPeerInfo] using congrArg (authorityFromImage whoami) hEq
+
+theorem mem_knownPeerImages_update_localInfo_of_ne_local
+    (snap : Snapshot) (localInfo : PGInfo) (peer : PeerInfo)
+    (hLocal : peer ≠ localKnownPeer snap.whoami snap.localInfo)
+    (hMem : peer ∈ knownPeerImages snap) :
+    peer ∈ knownPeerImages { snap with localInfo := localInfo } := by
+  unfold knownPeerImages at hMem ⊢
+  dsimp only at hMem ⊢
+  have hMem' := List.mem_append.mp hMem
+  rcases hMem' with hRemote | hLocalMem
+  · exact List.mem_append.mpr (Or.inl hRemote)
+  · exfalso
+    have hEq : peer = localKnownPeer snap.whoami snap.localInfo := by
+      simpa [localKnownPeer] using hLocalMem
+    exact hLocal hEq
+
 theorem localPeer_mem_knownPeerImages (snap : Snapshot) :
-    { osd := snap.whoami
-      committedSeq := (normalizedPGInfo snap.localInfo).committedSeq
-      committedLength := (normalizedPGInfo snap.localInfo).committedLength
-      image := (normalizedPGInfo snap.localInfo).image
-      lastEpochStarted := (normalizedPGInfo snap.localInfo).lastEpochStarted
-      lastIntervalStarted := (normalizedPGInfo snap.localInfo).lastIntervalStarted
-    } ∈ knownPeerImages snap := by
-  simp [knownPeerImages]
+    localKnownPeer snap.whoami snap.localInfo ∈ knownPeerImages snap := by
+  simp [localKnownPeer, knownPeerImages]
 
 theorem knownPeerImages_ne_nil (snap : Snapshot) :
     knownPeerImages snap ≠ [] := by
@@ -808,6 +923,34 @@ theorem imageInvariant_update_controlFlags
     localRecoveryPlanMatchesAuthority, knownPeerImages, actingReplicaImages]
     using h
 
+theorem imageInvariant_update_recovered
+    (snap : Snapshot) (recovered : List OsdId) :
+    ImageInvariant snap →
+      ImageInvariant {
+        snap with
+          recovered := recovered
+      } := by
+  intro h
+  simpa [ImageInvariant, authSourcesBackedByKnownPeers, authImageMatchesKnownPeers,
+    authSeqMatchesKnownPeers, authSourcesMatchKnownPeers, localWithinAuthority,
+    actingReplicaWithinAuthority, peerRecoveryPlansMatchAuthority,
+    localRecoveryPlanMatchesAuthority, knownPeerImages, actingReplicaImages]
+    using h
+
+theorem imageInvariant_update_lastPeeringReset
+    (snap : Snapshot) (lastPeeringReset : Epoch) :
+    ImageInvariant snap →
+      ImageInvariant {
+        snap with
+          lastPeeringReset := lastPeeringReset
+      } := by
+  intro h
+  simpa [ImageInvariant, authSourcesBackedByKnownPeers, authImageMatchesKnownPeers,
+    authSeqMatchesKnownPeers, authSourcesMatchKnownPeers, localWithinAuthority,
+    actingReplicaWithinAuthority, peerRecoveryPlansMatchAuthority,
+    localRecoveryPlanMatchesAuthority, knownPeerImages, actingReplicaImages]
+    using h
+
 theorem imageInvariant_transitionTo
     (snap : Snapshot) (newState : State) (reason : String) :
     ImageInvariant snap → ImageInvariant (transitionTo snap newState reason).1 := by
@@ -1087,6 +1230,158 @@ theorem authoritativeCommittedSeq_knownPeerImages_update_localInfo
       authoritativeCommittedSeq (knownPeerImages snap) := by
   simp [knownPeerImages, hSeq, authoritativeCommittedSeq]
 
+theorem rawAuthoritySources_knownPeerImages_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    rawAuthoritySources (knownPeerImages { snap with localInfo := localInfo }) =
+      rawAuthoritySources (knownPeerImages snap) := by
+  have hAuth :
+      authorityFromPeerInfo (localKnownPeer snap.whoami localInfo) =
+        authorityFromPeerInfo (localKnownPeer snap.whoami snap.localInfo) := by
+    rw [authorityFromPeerInfo_localKnownPeer, authorityFromPeerInfo_localKnownPeer, hImage]
+  unfold rawAuthoritySources knownPeerImages
+  simp only [List.foldr_append]
+  simpa [localKnownPeer] using congrArg AuthorityImage.entries hAuth
+
+theorem rawAuthoritySources_knownPeerImages_update_localInfo_of_authorityEq
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hAuth :
+      authorityFromPeerInfo (localKnownPeer snap.whoami localInfo) =
+        authorityFromPeerInfo (localKnownPeer snap.whoami snap.localInfo)) :
+    rawAuthoritySources (knownPeerImages { snap with localInfo := localInfo }) =
+      rawAuthoritySources (knownPeerImages snap) := by
+  unfold rawAuthoritySources knownPeerImages
+  simp only [List.foldr_append]
+  simpa [localKnownPeer] using congrArg AuthorityImage.entries hAuth
+
+theorem authoritativeSources_knownPeerImages_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    authoritativeSources (knownPeerImages { snap with localInfo := localInfo }) =
+      authoritativeSources (knownPeerImages snap) := by
+  unfold authoritativeSources
+  rw [rawAuthoritySources_knownPeerImages_update_localInfo snap localInfo hImage]
+
+theorem authoritativeSources_knownPeerImages_update_localInfo_of_authorityEq
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hAuth :
+      authorityFromPeerInfo (localKnownPeer snap.whoami localInfo) =
+        authorityFromPeerInfo (localKnownPeer snap.whoami snap.localInfo)) :
+    authoritativeSources (knownPeerImages { snap with localInfo := localInfo }) =
+      authoritativeSources (knownPeerImages snap) := by
+  unfold authoritativeSources
+  rw [rawAuthoritySources_knownPeerImages_update_localInfo_of_authorityEq snap localInfo hAuth]
+
+theorem authorityEntryBackedByKnownPeer_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (entry : ObjectId × ObjectAuthority)
+    (hBacked : authorityEntryBackedByKnownPeer (knownPeerImages snap) entry)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    authorityEntryBackedByKnownPeer (knownPeerImages { snap with localInfo := localInfo }) entry := by
+  unfold authorityEntryBackedByKnownPeer at hBacked ⊢
+  rcases hBacked with ⟨peer, hMem, hLen⟩
+  by_cases hLocal : peer = localKnownPeer snap.whoami snap.localInfo
+  · rw [hLocal] at hLen
+    refine ⟨localKnownPeer snap.whoami localInfo, ?_, ?_⟩
+    · simpa using localPeer_mem_knownPeerImages { snap with localInfo := localInfo }
+    · rw [effectivePeerImage_localKnownPeer] at hLen ⊢
+      simpa [hImage] using hLen
+  · refine ⟨peer, ?_, hLen⟩
+    exact mem_knownPeerImages_update_localInfo_of_ne_local snap localInfo peer hLocal hMem
+
+theorem authSourcesBackedByKnownPeers_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hBacked : authSourcesBackedByKnownPeers snap)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    authSourcesBackedByKnownPeers { snap with localInfo := localInfo } := by
+  intro entry hEntry
+  apply authorityEntryBackedByKnownPeer_update_localInfo snap localInfo entry
+  · simpa [authSourcesBackedByKnownPeers] using hBacked entry hEntry
+  · exact hImage
+
+theorem authImageMatchesKnownPeers_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hAuth : authImageMatchesKnownPeers snap)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    authImageMatchesKnownPeers { snap with localInfo := localInfo } := by
+  unfold authImageMatchesKnownPeers at hAuth ⊢
+  rw [authoritativeSources_knownPeerImages_update_localInfo snap localInfo hImage]
+  simpa using hAuth
+
+theorem authSeqMatchesKnownPeers_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hAuth : authSeqMatchesKnownPeers snap)
+    (hSeq :
+      (normalizedPGInfo localInfo).committedSeq =
+        (normalizedPGInfo snap.localInfo).committedSeq) :
+    authSeqMatchesKnownPeers { snap with localInfo := localInfo } := by
+  unfold authSeqMatchesKnownPeers at hAuth ⊢
+  rw [authoritativeCommittedSeq_knownPeerImages_update_localInfo snap localInfo hSeq]
+  simpa [hSeq] using hAuth
+
+theorem authSourcesMatchKnownPeers_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hAuth : authSourcesMatchKnownPeers snap)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    authSourcesMatchKnownPeers { snap with localInfo := localInfo } := by
+  unfold authSourcesMatchKnownPeers at hAuth ⊢
+  rw [authoritativeSources_knownPeerImages_update_localInfo snap localInfo hImage]
+  simpa using hAuth
+
+theorem localWithinAuthority_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hLocal : localWithinAuthority snap)
+    (hSeq : localInfo.committedSeq = snap.localInfo.committedSeq)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    localWithinAuthority { snap with localInfo := localInfo } := by
+  rcases hLocal with ⟨hSeqLe, hPrefix⟩
+  constructor
+  · simpa [hSeq] using hSeqLe
+  · simpa [hImage] using hPrefix
+
+theorem peerRecoveryPlansMatchAuthority_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hPlans : peerRecoveryPlansMatchAuthority snap)
+    (hSeq :
+      (normalizedPGInfo localInfo).committedSeq =
+        (normalizedPGInfo snap.localInfo).committedSeq)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    peerRecoveryPlansMatchAuthority { snap with localInfo := localInfo } := by
+  unfold peerRecoveryPlansMatchAuthority at hPlans ⊢
+  rw [authoritativeSources_knownPeerImages_update_localInfo snap localInfo hImage]
+  rw [authoritativeCommittedSeq_knownPeerImages_update_localInfo snap localInfo hSeq]
+  simpa [actingReplicaImages] using hPlans
+
+theorem localRecoveryPlanMatchesAuthority_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hPlans : localRecoveryPlanMatchesAuthority snap)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    localRecoveryPlanMatchesAuthority { snap with localInfo := localInfo } := by
+  unfold localRecoveryPlanMatchesAuthority at hPlans ⊢
+  rw [authoritativeSources_knownPeerImages_update_localInfo snap localInfo hImage]
+  simpa [pgImageRecoveryPlan, imageRecoveryGapsFromAuthority, hImage] using hPlans
+
+theorem imageInvariant_update_localInfo
+    (snap : Snapshot) (localInfo : PGInfo)
+    (hInvariant : ImageInvariant snap)
+    (hSeq :
+      (normalizedPGInfo localInfo).committedSeq =
+        (normalizedPGInfo snap.localInfo).committedSeq)
+    (hCommittedSeq : localInfo.committedSeq = snap.localInfo.committedSeq)
+    (hImage : effectivePGImage localInfo = effectivePGImage snap.localInfo) :
+    ImageInvariant { snap with localInfo := localInfo } := by
+  rcases hInvariant with
+    ⟨hBacked, hAuthImage, hAuthSeq, hAuthSources, hLocal, hActing, hPeerPlans, hLocalPlan⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact authSourcesBackedByKnownPeers_update_localInfo snap localInfo hBacked hImage
+  · exact authImageMatchesKnownPeers_update_localInfo snap localInfo hAuthImage hImage
+  · exact authSeqMatchesKnownPeers_update_localInfo snap localInfo hAuthSeq hSeq
+  · exact authSourcesMatchKnownPeers_update_localInfo snap localInfo hAuthSources hImage
+  · exact localWithinAuthority_update_localInfo snap localInfo hLocal hCommittedSeq hImage
+  · simpa [actingReplicaWithinAuthority, actingReplicaImages] using hActing
+  · exact peerRecoveryPlansMatchAuthority_update_localInfo snap localInfo hPeerPlans hSeq hImage
+  · exact localRecoveryPlanMatchesAuthority_update_localInfo snap localInfo hLocalPlan hImage
+
 theorem imageInvariant_tryActivatePreparedSnap
     (snap : Snapshot) :
     ImageInvariant (tryActivatePreparedSnap snap) := by
@@ -1304,6 +1599,46 @@ theorem imageInvariant_startPeeringPrimary
       rw [hResult]
       exact imageInvariant_chooseActing ((startPeeringPrimaryQueried snap priorOsds).1)
 
+theorem imageInvariant_onInitialize
+    (snap : Snapshot) (e : Event.Initialize) :
+    ImageInvariant (onInitialize snap e).1 := by
+  let rawBase : Snapshot := {
+    state := snap.state
+    pgid := e.pgid
+    whoami := e.whoami
+    epoch := e.epoch
+    acting := e.acting
+    up := e.up
+    poolSize := e.poolSize
+    poolMinSize := e.poolMinSize
+    localInfo := normalizedPGInfo e.localInfo
+  }
+  let refreshedBase := refreshImageStateFromKnownPeers (resetPeeringState rawBase)
+  let base : Snapshot := { refreshedBase with lastPeeringReset := e.epoch }
+  have hRefreshed : ImageInvariant refreshedBase := by
+    exact imageInvariant_refreshImageStateFromKnownPeers (resetPeeringState rawBase)
+  have hBase : ImageInvariant base := by
+    exact imageInvariant_update_lastPeeringReset refreshedBase e.epoch hRefreshed
+  by_cases hPrimary : e.acting.primary = some e.whoami
+  · have hResult :
+        (onInitialize snap e).1 = (startPeeringPrimary base e.priorOsds).1 := by
+      simp [onInitialize, rawBase, refreshedBase, base, hPrimary]
+    rw [hResult]
+    exact imageInvariant_startPeeringPrimary base e.priorOsds
+  · have hResult :
+        (onInitialize snap e).1 =
+          (transitionTo base .stray
+            (if e.acting.contains e.whoami then "initialize as replica"
+             else "initialize as stray")).1 := by
+      simp [onInitialize, rawBase, refreshedBase, base, hPrimary]
+    rw [hResult]
+    exact imageInvariant_transitionTo
+      base
+      .stray
+      (if e.acting.contains e.whoami then "initialize as replica"
+       else "initialize as stray")
+      hBase
+
 theorem imageInvariant_onPeerQueryTimeout_ignored
     (snap : Snapshot) (e : Event.PeerQueryTimeout)
     (hInvariant : ImageInvariant snap)
@@ -1388,6 +1723,115 @@ theorem imageInvariant_onPeerQueryTimeout
       exact imageInvariant_onPeerQueryTimeout_ignored snap e hInvariant (by simp [hState])
   | deleting =>
       exact imageInvariant_onPeerQueryTimeout_ignored snap e hInvariant (by simp [hState])
+
+def upThruUpdatedLocalInfo (snap : Snapshot) : PGInfo :=
+  if snap.localInfo.lastIntervalStarted < snap.epoch then
+    { snap.localInfo with lastIntervalStarted := snap.epoch }
+  else
+    snap.localInfo
+
+def upThruUpdatedBase (snap : Snapshot) : Snapshot :=
+  { snap with
+    needUpThru := false
+    localInfo := upThruUpdatedLocalInfo snap
+  }
+
+theorem effectivePGImage_upThruUpdatedLocalInfo
+    (snap : Snapshot) :
+    effectivePGImage (upThruUpdatedLocalInfo snap) = effectivePGImage snap.localInfo := by
+  unfold upThruUpdatedLocalInfo
+  by_cases h : snap.localInfo.lastIntervalStarted < snap.epoch
+  · simp [h, effectivePGImage]
+  · simp [h]
+
+theorem normalizedCommittedSeq_upThruUpdatedLocalInfo
+    (snap : Snapshot) :
+    (normalizedPGInfo (upThruUpdatedLocalInfo snap)).committedSeq =
+      (normalizedPGInfo snap.localInfo).committedSeq := by
+  unfold upThruUpdatedLocalInfo
+  by_cases h : snap.localInfo.lastIntervalStarted < snap.epoch <;> simp [h, normalizedPGInfo]
+
+theorem committedSeq_upThruUpdatedLocalInfo
+    (snap : Snapshot) :
+    (upThruUpdatedLocalInfo snap).committedSeq = snap.localInfo.committedSeq := by
+  unfold upThruUpdatedLocalInfo
+  by_cases h : snap.localInfo.lastIntervalStarted < snap.epoch <;> simp [h]
+
+theorem imageInvariant_upThruUpdatedBase
+    (snap : Snapshot)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (upThruUpdatedBase snap) := by
+  have hLocal :
+      ImageInvariant { snap with localInfo := upThruUpdatedLocalInfo snap } := by
+    exact imageInvariant_update_localInfo
+      snap
+      (upThruUpdatedLocalInfo snap)
+      hInvariant
+      (normalizedCommittedSeq_upThruUpdatedLocalInfo snap)
+      (committedSeq_upThruUpdatedLocalInfo snap)
+      (effectivePGImage_upThruUpdatedLocalInfo snap)
+  have hFlags :
+      ImageInvariant {
+        { snap with localInfo := upThruUpdatedLocalInfo snap } with
+          pendingActingChange := ({ snap with localInfo := upThruUpdatedLocalInfo snap }).pendingActingChange
+          needUpThru := false
+          activated := ({ snap with localInfo := upThruUpdatedLocalInfo snap }).activated
+      } := by
+    exact imageInvariant_update_controlFlags
+      { snap with localInfo := upThruUpdatedLocalInfo snap }
+      ({ snap with localInfo := upThruUpdatedLocalInfo snap }).pendingActingChange
+      false
+      ({ snap with localInfo := upThruUpdatedLocalInfo snap }).activated
+      hLocal
+  simpa [upThruUpdatedBase] using hFlags
+
+theorem imageInvariant_onUpThruUpdated_ignored
+    (snap : Snapshot) (e : Event.UpThruUpdated)
+    (hInvariant : ImageInvariant snap)
+    (hIgnored : snap.state ≠ .waitUpThru ∨ e.epoch ≠ snap.epoch) :
+    ImageInvariant (onUpThruUpdated snap e).1 := by
+  rcases hIgnored with hState | hEpoch
+  · simp [onUpThruUpdated, hState, hInvariant]
+  · by_cases hState : snap.state = .waitUpThru
+    · simp [onUpThruUpdated, hState, hEpoch, hInvariant]
+    · simp [onUpThruUpdated, hState, hInvariant]
+
+theorem imageInvariant_onUpThruUpdated
+    (snap : Snapshot) (e : Event.UpThruUpdated)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (onUpThruUpdated snap e).1 := by
+  by_cases hState : snap.state = .waitUpThru
+  · by_cases hEpoch : e.epoch = snap.epoch
+    · have hBase : ImageInvariant (upThruUpdatedBase snap) :=
+        imageInvariant_upThruUpdatedBase snap hInvariant
+      have hResult :
+          (onUpThruUpdated snap e).1 = (tryActivate (upThruUpdatedBase snap)).1 := by
+        simp [onUpThruUpdated, hState, hEpoch, upThruUpdatedBase, upThruUpdatedLocalInfo]
+      rw [hResult]
+      exact imageInvariant_tryActivate _ hBase
+    · exact imageInvariant_onUpThruUpdated_ignored snap e hInvariant (Or.inr hEpoch)
+  · exact imageInvariant_onUpThruUpdated_ignored snap e hInvariant (Or.inl hState)
+
+theorem imageInvariant_onActivateCommitted
+    (snap : Snapshot)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (onActivateCommitted snap).1 := by
+  by_cases hActive : snap.isActive
+  · have hFlags :
+        ImageInvariant {
+          snap with
+            pendingActingChange := snap.pendingActingChange
+            needUpThru := snap.needUpThru
+            activated := true
+        } := by
+      exact imageInvariant_update_controlFlags
+        snap
+        snap.pendingActingChange
+        snap.needUpThru
+        true
+        hInvariant
+    simpa [onActivateCommitted, hActive] using hFlags
+  · simp [onActivateCommitted, hActive, hInvariant]
 
 theorem imageInvariant_onPeerInfoReceived_ignored_disallowed
     (snap : Snapshot) (e : Event.PeerInfoReceived)
@@ -1735,11 +2179,811 @@ theorem imageInvariant_onAdvanceMap
                       rw [hResult]
                       exact hPoolBase
 
+def recoveryCompleteLocalInfo (snap : Snapshot) (e : Event.RecoveryComplete) : PGInfo :=
+  if e.peer = snap.whoami then
+    {
+      snap.localInfo with
+        image := snap.authImage
+        committedSeq := snap.authSeq
+        committedLength := primaryLength snap.authImage
+    }
+  else
+    snap.localInfo
+
+def recoveryCompleteRefreshedSnap (snap : Snapshot) (e : Event.RecoveryComplete) : Snapshot :=
+  refreshImageStateFromKnownPeers {
+    snap with
+      peerInfo := upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
+      localInfo := recoveryCompleteLocalInfo snap e
+      recovered := osdSetInsert snap.recovered e.peer
+  }
+
+theorem imageInvariant_recoveryCompleteRefreshedSnap
+    (snap : Snapshot) (e : Event.RecoveryComplete) :
+    ImageInvariant (recoveryCompleteRefreshedSnap snap e) := by
+  unfold recoveryCompleteRefreshedSnap
+  exact imageInvariant_refreshImageStateFromKnownPeers {
+    snap with
+      peerInfo := upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
+      localInfo := recoveryCompleteLocalInfo snap e
+      recovered := osdSetInsert snap.recovered e.peer
+  }
+
+theorem imageInvariant_onRecoveryComplete_ignored
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hState : snap.state ≠ .recovering ∨
+      e.epoch < snap.lastPeeringReset ∨ isImageRecoveryTarget snap e.peer = false) :
+    ImageInvariant (onRecoveryComplete snap e).1 := by
+  rcases hState with hState | hRest
+  · simp [onRecoveryComplete, hState, hInvariant]
+  · rcases hRest with hEpoch | hTarget
+    · by_cases hRecovering : snap.state = .recovering
+      · simp [onRecoveryComplete, hRecovering, hEpoch, hInvariant]
+      · simp [onRecoveryComplete, hRecovering, hInvariant]
+    · by_cases hRecovering : snap.state = .recovering
+      · by_cases hEpoch : e.epoch < snap.lastPeeringReset
+        · simp [onRecoveryComplete, hRecovering, hEpoch, hInvariant]
+        · simp [onRecoveryComplete, hRecovering, hEpoch, hTarget, hInvariant]
+      · simp [onRecoveryComplete, hRecovering, hInvariant]
+
+theorem imageInvariant_onRecoveryComplete_progress
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hState : snap.state = .recovering)
+    (hEpoch : ¬ e.epoch < snap.lastPeeringReset)
+    (hTarget : isImageRecoveryTarget snap e.peer = true)
+    (hClean : (imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e)).isEmpty = false) :
+    ImageInvariant (onRecoveryComplete snap e).1 := by
+  have hStateGuard : ¬ snap.state ≠ .recovering := by
+    simp [hState]
+  have hProgressGuard :
+      ¬ (e.epoch < snap.lastPeeringReset || !isImageRecoveryTarget snap e.peer) := by
+    simp [hEpoch, hTarget]
+  have hNotClean :
+      ¬ (imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e)).isEmpty = true := by
+    simpa using hClean
+  have hTargetsNe : imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e) ≠ [] := by
+    intro hNil
+    have : (imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e)).isEmpty = true := by
+      simp [hNil]
+    exact hNotClean this
+  have hResult : (onRecoveryComplete snap e).1 = recoveryCompleteRefreshedSnap snap e := by
+    unfold onRecoveryComplete recoveryCompleteRefreshedSnap recoveryCompleteLocalInfo
+    rw [if_neg hStateGuard]
+    rw [if_neg hProgressGuard]
+    rw [if_neg (by simpa using hTargetsNe)]
+  rw [hResult]
+  exact imageInvariant_recoveryCompleteRefreshedSnap snap e
+
+theorem imageInvariant_onRecoveryComplete_clean
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hState : snap.state = .recovering)
+    (hEpoch : ¬ e.epoch < snap.lastPeeringReset)
+    (hTarget : isImageRecoveryTarget snap e.peer = true)
+    (hClean : (imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e)).isEmpty = true) :
+    ImageInvariant (onRecoveryComplete snap e).1 := by
+  have hRefreshed : ImageInvariant (recoveryCompleteRefreshedSnap snap e) :=
+    imageInvariant_recoveryCompleteRefreshedSnap snap e
+  have hRecovered :
+      ImageInvariant { recoveryCompleteRefreshedSnap snap e with recovered := [] } := by
+    exact imageInvariant_update_recovered (recoveryCompleteRefreshedSnap snap e) [] hRefreshed
+  have hStateGuard : ¬ snap.state ≠ .recovering := by
+    simp [hState]
+  have hProgressGuard :
+      ¬ (e.epoch < snap.lastPeeringReset || !isImageRecoveryTarget snap e.peer) := by
+    simp [hEpoch, hTarget]
+  have hTargetsNil : imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e) = [] := by
+    simpa using hClean
+  have hResult :
+      (onRecoveryComplete snap e).1 =
+        (transitionTo
+          { recoveryCompleteRefreshedSnap snap e with recovered := [] }
+          .clean
+          "all replicas recovered").1 := by
+    unfold onRecoveryComplete recoveryCompleteRefreshedSnap recoveryCompleteLocalInfo
+    rw [if_neg hStateGuard]
+    rw [if_neg hProgressGuard]
+    rw [if_pos (by simpa using hTargetsNil)]
+  rw [hResult]
+  exact imageInvariant_transitionTo
+    { recoveryCompleteRefreshedSnap snap e with recovered := [] }
+    .clean
+    "all replicas recovered"
+    hRecovered
+
+theorem imageInvariant_onRecoveryComplete
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (onRecoveryComplete snap e).1 := by
+  by_cases hState : snap.state = .recovering
+  · by_cases hEpoch : e.epoch < snap.lastPeeringReset
+    · exact imageInvariant_onRecoveryComplete_ignored
+        snap e hInvariant (Or.inr (Or.inl hEpoch))
+    · cases hTarget : isImageRecoveryTarget snap e.peer with
+      | false =>
+          exact imageInvariant_onRecoveryComplete_ignored
+            snap e hInvariant (Or.inr (Or.inr hTarget))
+      | true =>
+          cases hClean : (imageRecoveryTargets (recoveryCompleteRefreshedSnap snap e)).isEmpty with
+          | false =>
+              exact imageInvariant_onRecoveryComplete_progress
+                snap e hState hEpoch hTarget hClean
+          | true =>
+              exact imageInvariant_onRecoveryComplete_clean
+                snap e hState hEpoch hTarget hClean
+  · exact imageInvariant_onRecoveryComplete_ignored snap e hInvariant (Or.inl hState)
+
+def allReplicasRecoveredCompleted
+    (snap : Snapshot) (e : Event.AllReplicasRecovered) : List OsdId :=
+  osdSetUnion snap.recovered e.peers
+
+def allReplicasRecoveredPeerInfo
+    (snap : Snapshot) (e : Event.AllReplicasRecovered) : PeerInfoMap :=
+  e.peers.foldl
+    (fun entries peer =>
+      upsertRecoveredPeerInfo entries peer snap.authSeq snap.authImage)
+    snap.peerInfo
+
+def allReplicasRecoveredLocalInfo (snap : Snapshot) : PGInfo :=
+  {
+    snap.localInfo with
+      image := snap.authImage
+      committedSeq := snap.authSeq
+      committedLength := primaryLength snap.authImage
+  }
+
+def allReplicasRecoveredRefreshedSnap
+    (snap : Snapshot) (e : Event.AllReplicasRecovered) : Snapshot :=
+  refreshImageStateFromKnownPeers {
+    snap with
+      peerInfo := allReplicasRecoveredPeerInfo snap e
+      localInfo := allReplicasRecoveredLocalInfo snap
+      recovered := allReplicasRecoveredCompleted snap e
+  }
+
+theorem imageInvariant_allReplicasRecoveredRefreshedSnap
+    (snap : Snapshot) (e : Event.AllReplicasRecovered) :
+    ImageInvariant (allReplicasRecoveredRefreshedSnap snap e) := by
+  unfold allReplicasRecoveredRefreshedSnap
+  exact imageInvariant_refreshImageStateFromKnownPeers {
+    snap with
+      peerInfo := allReplicasRecoveredPeerInfo snap e
+      localInfo := allReplicasRecoveredLocalInfo snap
+      recovered := allReplicasRecoveredCompleted snap e
+  }
+
+theorem imageInvariant_onAllReplicasRecovered_ignored_state
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap)
+    (hRecovering : snap.state ≠ .recovering)
+    (hActive : snap.state ≠ .active) :
+    ImageInvariant (onAllReplicasRecovered snap e).1 := by
+  simp [onAllReplicasRecovered, hRecovering, hActive, hInvariant]
+
+theorem imageInvariant_onAllReplicasRecovered_progress
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hState : snap.state = .recovering ∨ snap.state = .active)
+    (hEpoch : ¬ e.epoch < snap.lastPeeringReset)
+    (hTargets : boolAnd (e.peers.map fun peer => isImageRecoveryTarget snap peer) = true)
+    (hBatch :
+      osdSetEq (allReplicasRecoveredCompleted snap e) (imageRecoveryTargets snap) = true)
+    (hClean :
+      (imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e)).isEmpty = false) :
+    ImageInvariant (onAllReplicasRecovered snap e).1 := by
+  have hStateGuard : ¬ (snap.state ≠ .recovering && snap.state ≠ .active) := by
+    rcases hState with hRecovering | hActive
+    · simp [hRecovering]
+    · simp [hActive]
+  have hTargetsGuard :
+      ¬ !boolAnd (e.peers.map fun peer => isImageRecoveryTarget snap peer) := by
+    simp [hTargets]
+  have hBatch' :
+      osdSetEq (osdSetUnion snap.recovered e.peers) (imageRecoveryTargets snap) = true := by
+    simpa [allReplicasRecoveredCompleted] using hBatch
+  have hNotClean :
+      ¬ (imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e)).isEmpty = true := by
+    simpa using hClean
+  have hTargetsNe : imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e) ≠ [] := by
+    intro hNil
+    have : (imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e)).isEmpty = true := by
+      simp [hNil]
+    exact hNotClean this
+  have hResult :
+      (onAllReplicasRecovered snap e).1 = allReplicasRecoveredRefreshedSnap snap e := by
+    unfold onAllReplicasRecovered
+    rw [if_neg hStateGuard]
+    rw [if_neg hEpoch]
+    rw [if_neg hTargetsGuard]
+    simp [allReplicasRecoveredRefreshedSnap, allReplicasRecoveredPeerInfo,
+      allReplicasRecoveredLocalInfo, hBatch']
+    rw [if_neg (by simpa using hTargetsNe)]
+    simp [allReplicasRecoveredCompleted]
+  rw [hResult]
+  exact imageInvariant_allReplicasRecoveredRefreshedSnap snap e
+
+theorem imageInvariant_onAllReplicasRecovered_clean
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hState : snap.state = .recovering ∨ snap.state = .active)
+    (hEpoch : ¬ e.epoch < snap.lastPeeringReset)
+    (hTargets : boolAnd (e.peers.map fun peer => isImageRecoveryTarget snap peer) = true)
+    (hBatch :
+      osdSetEq (allReplicasRecoveredCompleted snap e) (imageRecoveryTargets snap) = true)
+    (hClean :
+      (imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e)).isEmpty = true) :
+    ImageInvariant (onAllReplicasRecovered snap e).1 := by
+  have hRefreshed : ImageInvariant (allReplicasRecoveredRefreshedSnap snap e) :=
+    imageInvariant_allReplicasRecoveredRefreshedSnap snap e
+  have hRecovered :
+      ImageInvariant { allReplicasRecoveredRefreshedSnap snap e with recovered := [] } := by
+    exact imageInvariant_update_recovered (allReplicasRecoveredRefreshedSnap snap e) [] hRefreshed
+  have hStateGuard : ¬ (snap.state ≠ .recovering && snap.state ≠ .active) := by
+    rcases hState with hRecovering | hActive
+    · simp [hRecovering]
+    · simp [hActive]
+  have hTargetsGuard :
+      ¬ !boolAnd (e.peers.map fun peer => isImageRecoveryTarget snap peer) := by
+    simp [hTargets]
+  have hBatch' :
+      osdSetEq (osdSetUnion snap.recovered e.peers) (imageRecoveryTargets snap) = true := by
+    simpa [allReplicasRecoveredCompleted] using hBatch
+  have hTargetsNil : imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e) = [] := by
+    simpa using hClean
+  have hResult :
+      (onAllReplicasRecovered snap e).1 =
+        (transitionTo
+          { allReplicasRecoveredRefreshedSnap snap e with recovered := [] }
+          .clean
+          "all replicas recovered (batch)").1 := by
+    unfold onAllReplicasRecovered
+    rw [if_neg hStateGuard]
+    rw [if_neg hEpoch]
+    rw [if_neg hTargetsGuard]
+    simp [allReplicasRecoveredRefreshedSnap, allReplicasRecoveredPeerInfo,
+      allReplicasRecoveredLocalInfo, hBatch']
+    rw [if_pos (by simpa using hTargetsNil)]
+    simp [allReplicasRecoveredCompleted]
+  rw [hResult]
+  exact imageInvariant_transitionTo
+    { allReplicasRecoveredRefreshedSnap snap e with recovered := [] }
+    .clean
+    "all replicas recovered (batch)"
+    hRecovered
+
+theorem imageInvariant_onAllReplicasRecovered_stateAccepted
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap)
+    (hState : snap.state = .recovering ∨ snap.state = .active) :
+    ImageInvariant (onAllReplicasRecovered snap e).1 := by
+  have hStateGuard : ¬ (snap.state ≠ .recovering && snap.state ≠ .active) := by
+    rcases hState with hRecovering | hActive
+    · simp [hRecovering]
+    · simp [hActive]
+  by_cases hEpoch : e.epoch < snap.lastPeeringReset
+  · unfold onAllReplicasRecovered
+    rw [if_neg hStateGuard]
+    rw [if_pos hEpoch]
+    exact hInvariant
+  · cases hTargets : boolAnd (e.peers.map fun peer => isImageRecoveryTarget snap peer) with
+    | false =>
+        unfold onAllReplicasRecovered
+        rw [if_neg hStateGuard]
+        rw [if_neg hEpoch]
+        simp [hTargets, hInvariant]
+    | true =>
+        cases hBatch :
+            osdSetEq (allReplicasRecoveredCompleted snap e) (imageRecoveryTargets snap) with
+        | false =>
+            have hBatch' :
+                osdSetEq (osdSetUnion snap.recovered e.peers) (imageRecoveryTargets snap) = false := by
+              simpa [allReplicasRecoveredCompleted] using hBatch
+            unfold onAllReplicasRecovered
+            rw [if_neg hStateGuard]
+            rw [if_neg hEpoch]
+            simp [hTargets, hBatch', hInvariant]
+        | true =>
+            cases hClean : (imageRecoveryTargets (allReplicasRecoveredRefreshedSnap snap e)).isEmpty with
+            | false =>
+                exact imageInvariant_onAllReplicasRecovered_progress
+                  snap e hState hEpoch hTargets hBatch hClean
+            | true =>
+                exact imageInvariant_onAllReplicasRecovered_clean
+                  snap e hState hEpoch hTargets hBatch hClean
+
+theorem imageInvariant_onAllReplicasRecovered
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (onAllReplicasRecovered snap e).1 := by
+  by_cases hRecovering : snap.state = .recovering
+  · exact imageInvariant_onAllReplicasRecovered_stateAccepted
+      snap e hInvariant (Or.inl hRecovering)
+  · by_cases hActive : snap.state = .active
+    · exact imageInvariant_onAllReplicasRecovered_stateAccepted
+        snap e hInvariant (Or.inr hActive)
+    · exact imageInvariant_onAllReplicasRecovered_ignored_state
+        snap e hInvariant hRecovering hActive
+
+def replicaActivateAuthInfo (e : Event.ReplicaActivate) : PeerInfo :=
+  normalizedPeerInfo e.authInfo
+
+def replicaActivateAuthSeq (e : Event.ReplicaActivate) : JournalSeq :=
+  let authInfo := replicaActivateAuthInfo e
+  if e.authoritativeSeq > 0 then e.authoritativeSeq else authInfo.committedSeq
+
+def replicaActivateAuthSources (e : Event.ReplicaActivate) : AuthorityImage :=
+  let authInfo := replicaActivateAuthInfo e
+  if authorityImageEmpty e.authSources then authorityFromPeerInfo authInfo else e.authSources
+
+def replicaActivateAuthImage (e : Event.ReplicaActivate) : ObjectImage :=
+  let authInfo := replicaActivateAuthInfo e
+  let authSources := replicaActivateAuthSources e
+  if authorityImageEmpty authSources then authInfo.image else authorityImageValues authSources
+
+def replicaActivateAdvanceHistory (snap : Snapshot) (e : Event.ReplicaActivate) : Bool :=
+  replicaActivateAuthSeq e ≤ snap.localInfo.committedSeq &&
+    prefixImage? (replicaActivateAuthImage e) (effectivePGImage snap.localInfo)
+
+def replicaActivateLocalImage (snap : Snapshot) (e : Event.ReplicaActivate) : ObjectImage :=
+  clampImageTo (replicaActivateAuthImage e) (effectivePGImage snap.localInfo)
+
+def replicaActivateLocalCommittedSeq (snap : Snapshot) (e : Event.ReplicaActivate) : JournalSeq :=
+  if replicaActivateAdvanceHistory snap e then
+    replicaActivateAuthSeq e
+  else
+    min snap.localInfo.committedSeq (replicaActivateAuthSeq e)
+
+def replicaActivateLocalInfo (snap : Snapshot) (e : Event.ReplicaActivate) : PGInfo :=
+  {
+    snap.localInfo with
+      image := replicaActivateLocalImage snap e
+      committedSeq := replicaActivateLocalCommittedSeq snap e
+      committedLength := primaryLength (replicaActivateLocalImage snap e)
+      lastEpochStarted :=
+        if replicaActivateAdvanceHistory snap e then
+          e.activationEpoch
+        else
+          snap.localInfo.lastEpochStarted
+      lastIntervalStarted :=
+        if replicaActivateAdvanceHistory snap e then
+          e.activationEpoch
+        else
+          snap.localInfo.lastIntervalStarted
+  }
+
+def replicaActivatePreparedSnap (snap : Snapshot) (e : Event.ReplicaActivate) : Snapshot :=
+  {
+    snap with
+      authSeq := replicaActivateAuthSeq e
+      authSources := replicaActivateAuthSources e
+      authImage := replicaActivateAuthImage e
+      localInfo := replicaActivateLocalInfo snap e
+  }
+
+def replicaActivateSupported (snap : Snapshot) (e : Event.ReplicaActivate) : Prop :=
+  replicaActivateAuthSeq e = authoritativeCommittedSeq (knownPeerImages snap) ∧
+    replicaActivateAuthSources e = authoritativeSources (knownPeerImages snap) ∧
+    replicaActivateAuthImage e =
+      authorityImageValues (authoritativeSources (knownPeerImages snap)) ∧
+    authorityFromPeerInfo (localKnownPeer snap.whoami (replicaActivateLocalInfo snap e)) =
+      authorityFromPeerInfo (localKnownPeer snap.whoami snap.localInfo)
+
+theorem effectivePGImage_replicaActivateLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaActivate) :
+    effectivePGImage (replicaActivateLocalInfo snap e) = replicaActivateLocalImage snap e := by
+  let image := replicaActivateLocalImage snap e
+  change effectivePGImage
+      { snap.localInfo with
+        image := image
+        committedSeq := replicaActivateLocalCommittedSeq snap e
+        committedLength := primaryLength image
+        lastEpochStarted :=
+          if replicaActivateAdvanceHistory snap e then
+            e.activationEpoch
+          else
+            snap.localInfo.lastEpochStarted
+        lastIntervalStarted :=
+          if replicaActivateAdvanceHistory snap e then
+            e.activationEpoch
+          else
+            snap.localInfo.lastIntervalStarted } = image
+  by_cases hEmpty : image.entries = []
+  · have hLen :
+        primaryLength image = 0 := by
+        simp [primaryLength, lookupLength, lookupLengthEntries, hEmpty]
+    simp [effectivePGImage, hEmpty, hLen]
+  · simp [effectivePGImage, hEmpty]
+
+theorem committedSeq_replicaActivateLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSeq :
+      replicaActivateAuthSeq e = authoritativeCommittedSeq (knownPeerImages snap)) :
+    (replicaActivateLocalInfo snap e).committedSeq = snap.localInfo.committedSeq := by
+  rcases hInvariant with ⟨_hBacked, _hAuthImage, hAuthSeq, _hAuthSources,
+    hLocal, _hActing, _hPeerPlans, _hLocalPlan⟩
+  rcases hLocal with ⟨hLocalSeq, _hLocalPrefix⟩
+  have hSeq' : replicaActivateAuthSeq e = snap.authSeq := by
+    rw [hSeq, ← hAuthSeq]
+  have hLocalSeq' : snap.localInfo.committedSeq ≤ replicaActivateAuthSeq e := by
+    simpa [hSeq'] using hLocalSeq
+  unfold replicaActivateLocalInfo replicaActivateLocalCommittedSeq
+  cases hAdvance : replicaActivateAdvanceHistory snap e with
+  | false =>
+      simp [Nat.min_eq_left hLocalSeq']
+  | true =>
+      have hAdvanceLe : replicaActivateAuthSeq e ≤ snap.localInfo.committedSeq := by
+        unfold replicaActivateAdvanceHistory at hAdvance
+        simp at hAdvance
+        exact hAdvance.1
+      have hEqSeq : snap.localInfo.committedSeq = replicaActivateAuthSeq e :=
+        Nat.le_antisymm hLocalSeq' hAdvanceLe
+      simp [hEqSeq]
+
+theorem normalizedCommittedSeq_replicaActivateLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSeq :
+      replicaActivateAuthSeq e = authoritativeCommittedSeq (knownPeerImages snap)) :
+    (normalizedPGInfo (replicaActivateLocalInfo snap e)).committedSeq =
+      (normalizedPGInfo snap.localInfo).committedSeq := by
+  simp [normalizedPGInfo, committedSeq_replicaActivateLocalInfo snap e hInvariant hSeq]
+
+theorem replicaActivatePreparedSnap_eq_refreshAuthorityFromKnownPeers
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    replicaActivatePreparedSnap snap e =
+      refreshAuthorityFromKnownPeers { snap with localInfo := replicaActivateLocalInfo snap e } := by
+  rcases hSupported with ⟨hSeq, hSources, hImage, hLocalAuth⟩
+  have hSeq' :
+      authoritativeCommittedSeq (knownPeerImages { snap with localInfo := replicaActivateLocalInfo snap e }) =
+        authoritativeCommittedSeq (knownPeerImages snap) := by
+    exact authoritativeCommittedSeq_knownPeerImages_update_localInfo
+      snap
+      (replicaActivateLocalInfo snap e)
+      (normalizedCommittedSeq_replicaActivateLocalInfo snap e hInvariant hSeq)
+  have hSources' :
+      authoritativeSources (knownPeerImages { snap with localInfo := replicaActivateLocalInfo snap e }) =
+        authoritativeSources (knownPeerImages snap) := by
+    exact authoritativeSources_knownPeerImages_update_localInfo_of_authorityEq
+      snap
+      (replicaActivateLocalInfo snap e)
+      hLocalAuth
+  unfold replicaActivatePreparedSnap refreshAuthorityFromKnownPeers
+  simp [hSeq, hSources, hImage, hSeq', hSources']
+
+theorem localWithinAuthority_replicaActivatePreparedSnap
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    localWithinAuthority (replicaActivatePreparedSnap snap e) := by
+  have hInvariant' := hInvariant
+  rcases hInvariant with ⟨_hBacked, _hAuthImage, hAuthSeq, _hAuthSources,
+    hLocal, _hActing, _hPeerPlans, _hLocalPlan⟩
+  rcases hLocal with ⟨hLocalSeq, _hLocalPrefix⟩
+  rcases hSupported with ⟨hSeq, _hSources, hImage, _hLocalAuth⟩
+  have hSeq' : replicaActivateAuthSeq e = snap.authSeq := by
+    rw [hSeq, ← hAuthSeq]
+  constructor
+  · simpa [replicaActivatePreparedSnap,
+      committedSeq_replicaActivateLocalInfo snap e hInvariant' hSeq, hSeq'] using hLocalSeq
+  · intro obj
+    rw [show effectivePGImage (replicaActivatePreparedSnap snap e).localInfo =
+        replicaActivateLocalImage snap e by
+          simp [replicaActivatePreparedSnap, effectivePGImage_replicaActivateLocalInfo]]
+    rw [show (replicaActivatePreparedSnap snap e).authImage = replicaActivateAuthImage e by
+          simp [replicaActivatePreparedSnap]]
+    simpa [replicaActivateLocalImage, hImage] using
+      (prefixImage_clampImageTo_left (replicaActivateAuthImage e) (effectivePGImage snap.localInfo) obj)
+
+theorem actingReplicaWithinAuthority_replicaActivatePreparedSnap
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    actingReplicaWithinAuthority (replicaActivatePreparedSnap snap e) := by
+  rcases hInvariant with ⟨_hBacked, hAuthImage, hAuthSeq, _hAuthSources,
+    _hLocal, hActing, _hPeerPlans, _hLocalPlan⟩
+  rcases hSupported with ⟨hSeq, _hSources, hImage, _hLocalAuth⟩
+  have hSeq' : replicaActivateAuthSeq e = snap.authSeq := by
+    rw [hSeq, ← hAuthSeq]
+  have hAuthPrefix :
+      prefixImage snap.authImage (replicaActivateAuthImage e) := by
+    rw [hImage]
+    exact sameImage_implies_prefix _ _ hAuthImage
+  intro peer hPeer
+  rcases hActing peer hPeer with ⟨hPeerSeq, hPeerPrefix⟩
+  constructor
+  · simpa [replicaActivatePreparedSnap, hSeq'] using hPeerSeq
+  · exact prefixImage_trans _ _ _ hPeerPrefix hAuthPrefix
+
+theorem imageInvariant_onReplicaActivate_supported
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    ImageInvariant (onReplicaActivate snap e).1 := by
+  by_cases hState : snap.state ≠ .stray ∧ snap.state ≠ .replicaActive
+  · simp [onReplicaActivate, hState, hInvariant]
+  · by_cases hActing : snap.acting.contains snap.whoami = false
+    · simp [onReplicaActivate, hState, hActing, hInvariant]
+    · by_cases hSenderEpoch :
+        e.activationEpoch ≠ snap.epoch ∨ e.sender ≠ snap.acting.primary.getD (-1)
+      · simp [onReplicaActivate, hState, hActing, hSenderEpoch, hInvariant]
+      · have hPreparedEq :=
+          replicaActivatePreparedSnap_eq_refreshAuthorityFromKnownPeers snap e hInvariant hSupported
+        have hActing' : (!snap.acting.contains snap.whoami) = false := by
+          cases hContains : snap.acting.contains snap.whoami <;> simp [hContains] at hActing ⊢
+        have hPreparedInvariant :
+            ImageInvariant
+              (refreshRecoveryPlansFromCurrentAuthority (replicaActivatePreparedSnap snap e)) := by
+          apply imageInvariant_refreshRecoveryPlansFromCurrentAuthority
+          · rw [hPreparedEq]
+            exact authSourcesBackedByKnownPeers_refreshAuthorityFromKnownPeers _
+          · rw [hPreparedEq]
+            exact authImageMatchesKnownPeers_refreshAuthorityFromKnownPeers _
+          · rw [hPreparedEq]
+            exact authSeq_eq_authoritativeCommittedSeq_refreshAuthorityFromKnownPeers _
+          · rw [hPreparedEq]
+            exact authSources_eq_authoritativeSources_refreshAuthorityFromKnownPeers _
+          · exact localWithinAuthority_replicaActivatePreparedSnap snap e hInvariant hSupported
+          · exact actingReplicaWithinAuthority_replicaActivatePreparedSnap snap e hInvariant hSupported
+        have hResult :
+            (onReplicaActivate snap e).1 =
+              (transitionTo
+                (refreshRecoveryPlansFromCurrentAuthority (replicaActivatePreparedSnap snap e))
+                .replicaActive
+                "activated by primary").1 := by
+          simp [onReplicaActivate, hState, hActing', hSenderEpoch,
+            replicaActivatePreparedSnap, replicaActivateAuthInfo, replicaActivateAuthSeq,
+            replicaActivateAuthSources, replicaActivateAuthImage, replicaActivateAdvanceHistory,
+            replicaActivateLocalImage, replicaActivateLocalCommittedSeq, replicaActivateLocalInfo]
+        rw [hResult]
+        exact imageInvariant_transitionTo
+          (refreshRecoveryPlansFromCurrentAuthority (replicaActivatePreparedSnap snap e))
+          .replicaActive
+          "activated by primary"
+          hPreparedInvariant
+
+def replicaRecoveryCompleteRecoveredImage (e : Event.ReplicaRecoveryComplete) : ObjectImage :=
+  if objectImageEmpty e.recoveredImage && e.newCommittedLength > 0 then
+    primaryImage e.newCommittedLength
+  else
+    e.recoveredImage
+
+def replicaRecoveryCompleteClampedImage
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) : ObjectImage :=
+  clampImageTo snap.authImage
+    (joinImage (effectivePGImage snap.localInfo) (replicaRecoveryCompleteRecoveredImage e))
+
+def replicaRecoveryCompleteRecoveredSeq
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) : JournalSeq :=
+  if e.newCommittedSeq = 0 && !objectImageEmpty (replicaRecoveryCompleteRecoveredImage e) &&
+      sameImage? (replicaRecoveryCompleteRecoveredImage e) snap.authImage then
+    snap.authSeq
+  else
+    e.newCommittedSeq
+
+def replicaRecoveryCompleteLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) : PGInfo :=
+  {
+    snap.localInfo with
+      image := replicaRecoveryCompleteClampedImage snap e
+      committedSeq := replicaRecoveryCompleteRecoveredSeq snap e
+      committedLength := primaryLength (replicaRecoveryCompleteClampedImage snap e)
+      lastEpochStarted := e.activationEpoch
+      lastIntervalStarted := e.activationEpoch
+  }
+
+def replicaRecoveryCompletePreparedSnap
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) : Snapshot :=
+  refreshRecoveryPlansFromCurrentAuthority
+    { snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }
+
+def replicaRecoveryCompleteSupported
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) : Prop :=
+  snap.authSources = authoritativeSources (knownPeerImages snap) ∧
+    effectivePGImage (replicaRecoveryCompleteLocalInfo snap e) =
+      effectivePGImage snap.localInfo ∧
+    (replicaRecoveryCompleteLocalInfo snap e).committedSeq = snap.localInfo.committedSeq
+
+theorem effectivePGImage_replicaRecoveryCompleteLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete) :
+    effectivePGImage (replicaRecoveryCompleteLocalInfo snap e) =
+      replicaRecoveryCompleteClampedImage snap e := by
+  let image := replicaRecoveryCompleteClampedImage snap e
+  change effectivePGImage
+      { snap.localInfo with
+        image := image
+        committedSeq := replicaRecoveryCompleteRecoveredSeq snap e
+        committedLength := primaryLength image
+        lastEpochStarted := e.activationEpoch
+        lastIntervalStarted := e.activationEpoch } = image
+  by_cases hEmpty : image.entries = []
+  · have hLen : primaryLength image = 0 := by
+      simp [primaryLength, lookupLength, lookupLengthEntries, hEmpty]
+    simp [effectivePGImage, hEmpty, hLen]
+  · simp [effectivePGImage, hEmpty]
+
+theorem normalizedCommittedSeq_replicaRecoveryCompleteLocalInfo
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hCommitted :
+      (replicaRecoveryCompleteLocalInfo snap e).committedSeq =
+        snap.localInfo.committedSeq) :
+    (normalizedPGInfo (replicaRecoveryCompleteLocalInfo snap e)).committedSeq =
+      (normalizedPGInfo snap.localInfo).committedSeq := by
+  simpa [normalizedPGInfo] using hCommitted
+
+theorem imageInvariant_replicaRecoveryCompletePreparedSnap
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaRecoveryCompleteSupported snap e) :
+    ImageInvariant (replicaRecoveryCompletePreparedSnap snap e) := by
+  rcases hSupported with ⟨hSources, hImage, hCommitted⟩
+  have hLocal :
+      ImageInvariant { snap with localInfo := replicaRecoveryCompleteLocalInfo snap e } := by
+    exact imageInvariant_update_localInfo
+      snap
+      (replicaRecoveryCompleteLocalInfo snap e)
+      hInvariant
+      (normalizedCommittedSeq_replicaRecoveryCompleteLocalInfo snap e hCommitted)
+      hCommitted
+      hImage
+  have hSources' :
+      ({ snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }).authSources =
+        authoritativeSources
+          (knownPeerImages { snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }) := by
+    calc
+      ({ snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }).authSources =
+          snap.authSources := by
+            rfl
+      _ = authoritativeSources (knownPeerImages snap) := hSources
+      _ = authoritativeSources
+            (knownPeerImages { snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }) := by
+            symm
+            exact authoritativeSources_knownPeerImages_update_localInfo
+              snap
+              (replicaRecoveryCompleteLocalInfo snap e)
+              hImage
+  rcases hLocal with ⟨hBacked, hAuthImage, hAuthSeq, _hAuthSourcesMatch,
+    hLocalWithin, hActing, _hPeerPlans, _hLocalPlan⟩
+  exact imageInvariant_refreshRecoveryPlansFromCurrentAuthority
+    { snap with localInfo := replicaRecoveryCompleteLocalInfo snap e }
+    hBacked
+    hAuthImage
+    hAuthSeq
+    hSources'
+    hLocalWithin
+    hActing
+
+theorem imageInvariant_onReplicaRecoveryComplete_supported
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaRecoveryCompleteSupported snap e) :
+    ImageInvariant (onReplicaRecoveryComplete snap e).1 := by
+  by_cases hState : snap.state = .replicaActive
+  · by_cases hEpoch : e.activationEpoch < snap.lastPeeringReset
+    · simp [onReplicaRecoveryComplete, hState, hEpoch, hInvariant]
+    · have hClampedEq :
+          replicaRecoveryCompleteClampedImage snap e = effectivePGImage snap.localInfo := by
+        calc
+          replicaRecoveryCompleteClampedImage snap e =
+              effectivePGImage (replicaRecoveryCompleteLocalInfo snap e) := by
+                symm
+                exact effectivePGImage_replicaRecoveryCompleteLocalInfo snap e
+          _ = effectivePGImage snap.localInfo := hSupported.2.1
+      have hPrefix :
+          prefixImage? (effectivePGImage snap.localInfo)
+            (replicaRecoveryCompleteClampedImage snap e) = true := by
+        rw [hClampedEq]
+        exact prefixImage?_refl (effectivePGImage snap.localInfo)
+      by_cases hActivation : e.activationEpoch < snap.localInfo.lastEpochStarted
+      · simp [onReplicaRecoveryComplete, hState, hEpoch, hActivation, hInvariant]
+      · have hPrepared :
+            ImageInvariant (replicaRecoveryCompletePreparedSnap snap e) :=
+          imageInvariant_replicaRecoveryCompletePreparedSnap snap e hInvariant hSupported
+        rcases hInvariant with ⟨_hBacked, _hAuthImage, _hAuthSeq, _hAuthSources,
+          hLocalWithin, _hActing, _hPeerPlans, _hLocalPlan⟩
+        rcases hLocalWithin with ⟨hLocalSeq, _hLocalPrefix⟩
+        have hResult :
+            (onReplicaRecoveryComplete snap e).1 = (replicaRecoveryCompletePreparedSnap snap e) := by
+          have hStateGuard : ¬ snap.state ≠ .replicaActive := by
+            simp [hState]
+          have hPrefixGuard :
+              ¬ prefixImage? (effectivePGImage snap.localInfo)
+                  (clampImageTo snap.authImage
+                    (joinImage (effectivePGImage snap.localInfo)
+                      (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                        primaryImage e.newCommittedLength
+                      else
+                        e.recoveredImage))) =
+                false := by
+            simpa [replicaRecoveryCompleteClampedImage, replicaRecoveryCompleteRecoveredImage] using
+              (show
+                ¬ prefixImage? (effectivePGImage snap.localInfo)
+                    (replicaRecoveryCompleteClampedImage snap e) = false from by
+                  rw [hPrefix]
+                  simp)
+          have hRecoveredSeq' :
+              (if
+                    (e.newCommittedSeq = 0 ∧
+                        objectImageEmpty
+                            (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                              primaryImage e.newCommittedLength
+                            else
+                              e.recoveredImage) =
+                          false) ∧
+                      sameImage?
+                          (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                            primaryImage e.newCommittedLength
+                          else
+                            e.recoveredImage)
+                          snap.authImage =
+                        true then
+                  snap.authSeq
+                else
+                  e.newCommittedSeq) =
+                snap.localInfo.committedSeq := by
+            simpa [replicaRecoveryCompleteLocalInfo, replicaRecoveryCompleteRecoveredSeq,
+              replicaRecoveryCompleteRecoveredImage] using
+              hSupported.2.2
+          have hSeqGuard :
+              ¬ ((if
+                      (e.newCommittedSeq = 0 ∧
+                          objectImageEmpty
+                              (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                                primaryImage e.newCommittedLength
+                              else
+                                e.recoveredImage) =
+                            false) ∧
+                        sameImage?
+                            (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                              primaryImage e.newCommittedLength
+                            else
+                              e.recoveredImage)
+                            snap.authImage =
+                          true then
+                    snap.authSeq
+                  else
+                    e.newCommittedSeq) <
+                    snap.localInfo.committedSeq ∨
+                  snap.authSeq <
+                    if
+                        (e.newCommittedSeq = 0 ∧
+                            objectImageEmpty
+                                (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                                  primaryImage e.newCommittedLength
+                                else
+                                  e.recoveredImage) =
+                              false) ∧
+                          sameImage?
+                              (if objectImageEmpty e.recoveredImage = true ∧ 0 < e.newCommittedLength then
+                                primaryImage e.newCommittedLength
+                              else
+                                e.recoveredImage)
+                              snap.authImage =
+                            true then
+                      snap.authSeq
+                    else
+                      e.newCommittedSeq) := by
+            rw [hRecoveredSeq']
+            simp [hLocalSeq]
+          simp [onReplicaRecoveryComplete, replicaRecoveryCompletePreparedSnap,
+            replicaRecoveryCompleteLocalInfo, replicaRecoveryCompleteClampedImage,
+            replicaRecoveryCompleteRecoveredSeq, replicaRecoveryCompleteRecoveredImage,
+            hStateGuard, hEpoch, hPrefixGuard, hActivation, hSeqGuard]
+        rw [hResult]
+        exact hPrepared
+  · have hState' : snap.state ≠ .replicaActive := hState
+    simp [onReplicaRecoveryComplete, hState', hInvariant]
+
 theorem imageInvariant_reduceValidated_peerInfoReceived
     (snap : Snapshot) (e : Event.PeerInfoReceived)
     (hInvariant : ImageInvariant snap) :
     ImageInvariant (reduceValidated snap (.peerInfoReceived e)).1 := by
   simpa [reduceValidated] using imageInvariant_onPeerInfoReceived snap e hInvariant
+
+theorem imageInvariant_reduceValidated_initialize
+    (snap : Snapshot) (e : Event.Initialize) :
+    ImageInvariant (reduceValidated snap (.initialize e)).1 := by
+  simpa [reduceValidated] using imageInvariant_onInitialize snap e
 
 theorem imageInvariant_reduceValidated_advanceMap
     (snap : Snapshot) (e : Event.AdvanceMap)
@@ -1753,12 +2997,58 @@ theorem imageInvariant_reduceValidated_peerQueryTimeout
     ImageInvariant (reduceValidated snap (.peerQueryTimeout e)).1 := by
   simpa [reduceValidated] using imageInvariant_onPeerQueryTimeout snap e hInvariant
 
+theorem imageInvariant_reduceValidated_upThruUpdated
+    (snap : Snapshot) (e : Event.UpThruUpdated)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (reduceValidated snap (.upThruUpdated e)).1 := by
+  simpa [reduceValidated] using imageInvariant_onUpThruUpdated snap e hInvariant
+
+theorem imageInvariant_reduceValidated_activateCommitted
+    (snap : Snapshot) (e : Event.ActivateCommitted)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (reduceValidated snap (.activateCommitted e)).1 := by
+  simpa [reduceValidated] using imageInvariant_onActivateCommitted snap hInvariant
+
+theorem imageInvariant_reduceValidated_recoveryComplete
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (reduceValidated snap (.recoveryComplete e)).1 := by
+  simpa [reduceValidated] using imageInvariant_onRecoveryComplete snap e hInvariant
+
+theorem imageInvariant_reduceValidated_allReplicasRecovered
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (reduceValidated snap (.allReplicasRecovered e)).1 := by
+  simpa [reduceValidated] using imageInvariant_onAllReplicasRecovered snap e hInvariant
+
+theorem imageInvariant_reduceValidated_replicaActivate_supported
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    ImageInvariant (reduceValidated snap (.replicaActivate e)).1 := by
+  simpa [reduceValidated] using
+    imageInvariant_onReplicaActivate_supported snap e hInvariant hSupported
+
+theorem imageInvariant_reduceValidated_replicaRecoveryComplete_supported
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaRecoveryCompleteSupported snap e) :
+    ImageInvariant (reduceValidated snap (.replicaRecoveryComplete e)).1 := by
+  simpa [reduceValidated] using
+    imageInvariant_onReplicaRecoveryComplete_supported snap e hInvariant hSupported
+
 theorem imageInvariant_stepWithValidated_peerInfoReceived
     (snap : Snapshot) (e : Event.PeerInfoReceived)
     (hInvariant : ImageInvariant snap) :
     ImageInvariant (stepWithValidated snap (.peerInfoReceived e)).after := by
   simpa [stepWithValidated] using
     imageInvariant_reduceValidated_peerInfoReceived snap e hInvariant
+
+theorem imageInvariant_stepWithValidated_initialize
+    (snap : Snapshot) (e : Event.Initialize) :
+    ImageInvariant (stepWithValidated snap (.initialize e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_initialize snap e
 
 theorem imageInvariant_stepWithValidated_advanceMap
     (snap : Snapshot) (e : Event.AdvanceMap)
@@ -1774,6 +3064,50 @@ theorem imageInvariant_stepWithValidated_peerQueryTimeout
   simpa [stepWithValidated] using
     imageInvariant_reduceValidated_peerQueryTimeout snap e hInvariant
 
+theorem imageInvariant_stepWithValidated_upThruUpdated
+    (snap : Snapshot) (e : Event.UpThruUpdated)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (stepWithValidated snap (.upThruUpdated e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_upThruUpdated snap e hInvariant
+
+theorem imageInvariant_stepWithValidated_activateCommitted
+    (snap : Snapshot) (e : Event.ActivateCommitted)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (stepWithValidated snap (.activateCommitted e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_activateCommitted snap e hInvariant
+
+theorem imageInvariant_stepWithValidated_recoveryComplete
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (stepWithValidated snap (.recoveryComplete e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_recoveryComplete snap e hInvariant
+
+theorem imageInvariant_stepWithValidated_allReplicasRecovered
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (stepWithValidated snap (.allReplicasRecovered e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_allReplicasRecovered snap e hInvariant
+
+theorem imageInvariant_stepWithValidated_replicaActivate_supported
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaActivateSupported snap e) :
+    ImageInvariant (stepWithValidated snap (.replicaActivate e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_replicaActivate_supported snap e hInvariant hSupported
+
+theorem imageInvariant_stepWithValidated_replicaRecoveryComplete_supported
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : replicaRecoveryCompleteSupported snap e) :
+    ImageInvariant (stepWithValidated snap (.replicaRecoveryComplete e)).after := by
+  simpa [stepWithValidated] using
+    imageInvariant_reduceValidated_replicaRecoveryComplete_supported snap e hInvariant hSupported
+
 theorem imageInvariant_step_peerInfoReceived
     (snap : Snapshot) (e : Event.PeerInfoReceived)
     (hInvariant : ImageInvariant snap) :
@@ -1784,6 +3118,12 @@ theorem imageInvariant_step_peerInfoReceived
   · simpa [hFresh, stepWithValidated] using
       imageInvariant_reduceValidated_peerInfoReceived snap e hInvariant
   · simp [hFresh, hInvariant]
+
+theorem imageInvariant_step_initialize
+    (snap : Snapshot) (e : Event.Initialize) :
+    ImageInvariant (step snap (.initialize e)).after := by
+  simpa [step, validateEvent, stepWithValidated] using
+    imageInvariant_reduceValidated_initialize snap e
 
 theorem imageInvariant_step_advanceMap
     (snap : Snapshot) (e : Event.AdvanceMap)
@@ -1799,52 +3139,246 @@ theorem imageInvariant_step_peerQueryTimeout
   simpa [step, validateEvent, stepWithValidated] using
     imageInvariant_reduceValidated_peerQueryTimeout snap e hInvariant
 
-def imageInvariantReduceValidatedSupported (event : ValidatedEvent) : Prop :=
+theorem imageInvariant_step_upThruUpdated
+    (snap : Snapshot) (e : Event.UpThruUpdated)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (step snap (.upThruUpdated e)).after := by
+  simpa [step, validateEvent, stepWithValidated] using
+    imageInvariant_reduceValidated_upThruUpdated snap e hInvariant
+
+theorem imageInvariant_step_activateCommitted
+    (snap : Snapshot) (e : Event.ActivateCommitted)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (step snap (.activateCommitted e)).after := by
+  simpa [step, validateEvent, stepWithValidated] using
+    imageInvariant_reduceValidated_activateCommitted snap e hInvariant
+
+theorem imageInvariant_step_recoveryComplete
+    (snap : Snapshot) (e : Event.RecoveryComplete)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (step snap (.recoveryComplete e)).after := by
+  unfold step
+  unfold validateEvent
+  by_cases hFresh : isFreshEpoch snap.lastPeeringReset e.epoch
+  · simpa [hFresh, stepWithValidated] using
+      imageInvariant_reduceValidated_recoveryComplete snap e hInvariant
+  · simp [hFresh, hInvariant]
+
+theorem imageInvariant_step_allReplicasRecovered
+    (snap : Snapshot) (e : Event.AllReplicasRecovered)
+    (hInvariant : ImageInvariant snap) :
+    ImageInvariant (step snap (.allReplicasRecovered e)).after := by
+  unfold step
+  unfold validateEvent
+  by_cases hFresh : isFreshEpoch snap.lastPeeringReset e.epoch
+  · simpa [hFresh, stepWithValidated] using
+      imageInvariant_reduceValidated_allReplicasRecovered snap e hInvariant
+  · simp [hFresh, hInvariant]
+
+theorem imageInvariant_step_replicaActivate_supported
+    (snap : Snapshot) (e : Event.ReplicaActivate)
+    (hInvariant : ImageInvariant snap)
+    (hFresh : isFreshEpoch snap.lastPeeringReset e.activationEpoch = true)
+    (hSupported : replicaActivateSupported snap e) :
+    ImageInvariant (step snap (.replicaActivate e)).after := by
+  unfold step
+  unfold validateEvent
+  simpa [hFresh, stepWithValidated] using
+    imageInvariant_reduceValidated_replicaActivate_supported snap e hInvariant hSupported
+
+theorem imageInvariant_step_replicaRecoveryComplete_supported
+    (snap : Snapshot) (e : Event.ReplicaRecoveryComplete)
+    (hInvariant : ImageInvariant snap)
+    (hFresh : isFreshEpoch snap.lastPeeringReset e.activationEpoch = true)
+    (hSupported : replicaRecoveryCompleteSupported snap e) :
+    ImageInvariant (step snap (.replicaRecoveryComplete e)).after := by
+  unfold step
+  unfold validateEvent
+  simpa [hFresh, stepWithValidated] using
+    imageInvariant_reduceValidated_replicaRecoveryComplete_supported snap e hInvariant hSupported
+
+def imageInvariantReduceValidatedSupported (snap : Snapshot) (event : ValidatedEvent) : Prop :=
   match event with
+  | .initialize _ => True
   | .advanceMap _ => True
   | .peerInfoReceived _ => True
   | .peerQueryTimeout _ => True
+  | .upThruUpdated _ => True
+  | .activateCommitted _ => True
+  | .recoveryComplete _ => True
+  | .allReplicasRecovered _ => True
+  | .replicaActivate e => replicaActivateSupported snap e
+  | .replicaRecoveryComplete e => replicaRecoveryCompleteSupported snap e
   | _ => False
 
 theorem imageInvariant_reduceValidated_supported
     (snap : Snapshot) (event : ValidatedEvent)
     (hInvariant : ImageInvariant snap)
-    (hSupported : imageInvariantReduceValidatedSupported event) :
+    (hSupported : imageInvariantReduceValidatedSupported snap event) :
     ImageInvariant (reduceValidated snap event).1 := by
   cases event <;> simp [imageInvariantReduceValidatedSupported] at hSupported
+  · rename_i e
+    exact imageInvariant_reduceValidated_initialize snap e
   · rename_i e
     exact imageInvariant_reduceValidated_advanceMap snap e hInvariant
   · rename_i e
     exact imageInvariant_reduceValidated_peerInfoReceived snap e hInvariant
   · rename_i e
     exact imageInvariant_reduceValidated_peerQueryTimeout snap e hInvariant
+  · rename_i e
+    exact imageInvariant_reduceValidated_upThruUpdated snap e hInvariant
+  · rename_i e
+    exact imageInvariant_reduceValidated_activateCommitted snap e hInvariant
+  · rename_i e
+    exact imageInvariant_reduceValidated_recoveryComplete snap e hInvariant
+  · rename_i e
+    exact imageInvariant_reduceValidated_allReplicasRecovered snap e hInvariant
+  · rename_i e
+    exact imageInvariant_reduceValidated_replicaActivate_supported snap e hInvariant hSupported
+  · rename_i e
+    exact imageInvariant_reduceValidated_replicaRecoveryComplete_supported snap e hInvariant hSupported
 
 theorem imageInvariant_stepWithValidated_supported
     (snap : Snapshot) (event : ValidatedEvent)
     (hInvariant : ImageInvariant snap)
-    (hSupported : imageInvariantReduceValidatedSupported event) :
+    (hSupported : imageInvariantReduceValidatedSupported snap event) :
     ImageInvariant (stepWithValidated snap event).after := by
   simpa [stepWithValidated] using
     imageInvariant_reduceValidated_supported snap event hInvariant hSupported
 
-def imageInvariantStepSupported (event : PeeringEvent) : Prop :=
+def imageInvariantStepSupported (snap : Snapshot) (event : PeeringEvent) : Prop :=
   match event with
+  | .initialize _ => True
   | .advanceMap _ => True
   | .peerInfoReceived _ => True
   | .peerQueryTimeout _ => True
+  | .upThruUpdated _ => True
+  | .activateCommitted _ => True
+  | .recoveryComplete _ => True
+  | .allReplicasRecovered _ => True
+  | .replicaActivate e =>
+      isFreshEpoch snap.lastPeeringReset e.activationEpoch = true ∧
+        replicaActivateSupported snap e
+  | .replicaRecoveryComplete e =>
+      isFreshEpoch snap.lastPeeringReset e.activationEpoch = true ∧
+        replicaRecoveryCompleteSupported snap e
   | _ => False
 
 theorem imageInvariant_step_supported
     (snap : Snapshot) (event : PeeringEvent)
     (hInvariant : ImageInvariant snap)
-    (hSupported : imageInvariantStepSupported event) :
+    (hSupported : imageInvariantStepSupported snap event) :
     ImageInvariant (step snap event).after := by
   cases event <;> simp [imageInvariantStepSupported] at hSupported
+  · rename_i e
+    exact imageInvariant_step_initialize snap e
   · rename_i e
     exact imageInvariant_step_advanceMap snap e hInvariant
   · rename_i e
     exact imageInvariant_step_peerInfoReceived snap e hInvariant
   · rename_i e
     exact imageInvariant_step_peerQueryTimeout snap e hInvariant
+  · rename_i e
+    exact imageInvariant_step_upThruUpdated snap e hInvariant
+  · rename_i e
+    exact imageInvariant_step_activateCommitted snap e hInvariant
+  · rename_i e
+    exact imageInvariant_step_recoveryComplete snap e hInvariant
+  · rename_i e
+    exact imageInvariant_step_allReplicasRecovered snap e hInvariant
+  · rename_i e
+    exact imageInvariant_step_replicaActivate_supported snap e hInvariant hSupported.1 hSupported.2
+  · rename_i e
+    exact imageInvariant_step_replicaRecoveryComplete_supported
+      snap e hInvariant hSupported.1 hSupported.2
+
+inductive ReduceValidatedTraceSupported : Snapshot -> List ValidatedEvent -> Prop where
+  | nil (snap : Snapshot) :
+      ReduceValidatedTraceSupported snap []
+  | cons (snap : Snapshot) (event : ValidatedEvent) (events : List ValidatedEvent)
+      (hHead : imageInvariantReduceValidatedSupported snap event)
+      (hTail : ReduceValidatedTraceSupported (reduceValidated snap event).1 events) :
+      ReduceValidatedTraceSupported snap (event :: events)
+
+inductive StepTraceSupported : Snapshot -> List PeeringEvent -> Prop where
+  | nil (snap : Snapshot) :
+      StepTraceSupported snap []
+  | cons (snap : Snapshot) (event : PeeringEvent) (events : List PeeringEvent)
+      (hHead : imageInvariantStepSupported snap event)
+      (hTail : StepTraceSupported (step snap event).after events) :
+      StepTraceSupported snap (event :: events)
+
+theorem imageInvariant_reduceValidatedTrace_supported
+    (snap : Snapshot) (events : List ValidatedEvent)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : ReduceValidatedTraceSupported snap events) :
+    ImageInvariant (reduceValidatedTrace snap events) := by
+  induction hSupported with
+  | nil snap =>
+      simpa [reduceValidatedTrace] using hInvariant
+  | cons snap event events hHead hTail ih =>
+      simpa [reduceValidatedTrace] using
+        ih (imageInvariant_reduceValidated_supported snap event hInvariant hHead)
+
+theorem imageInvariant_stepTrace_supported
+    (snap : Snapshot) (events : List PeeringEvent)
+    (hInvariant : ImageInvariant snap)
+    (hSupported : StepTraceSupported snap events) :
+    ImageInvariant (stepTrace snap events) := by
+  induction hSupported with
+  | nil snap =>
+      simpa [stepTrace] using hInvariant
+  | cons snap event events hHead hTail ih =>
+      simpa [stepTrace] using
+        ih (imageInvariant_step_supported snap event hInvariant hHead)
+
+theorem imageInvariant_stepTrace_fromInitialize_supported
+    (snap : Snapshot) (e : Event.Initialize) (events : List PeeringEvent)
+    (hSupported : StepTraceSupported (step snap (.initialize e)).after events) :
+    ImageInvariant (stepTrace snap (.initialize e :: events)) := by
+  have hInit : ImageInvariant (step snap (.initialize e)).after :=
+    imageInvariant_step_initialize snap e
+  simpa [stepTrace] using
+    imageInvariant_stepTrace_supported (step snap (.initialize e)).after events hInit hSupported
+
+def ReduceValidatedReachableFrom (start finish : Snapshot) : Prop :=
+  ∃ events,
+    ReduceValidatedTraceSupported start events ∧
+      reduceValidatedTrace start events = finish
+
+def StepReachableFrom (start finish : Snapshot) : Prop :=
+  ∃ events,
+    StepTraceSupported start events ∧
+      stepTrace start events = finish
+
+theorem imageInvariant_of_reduceValidatedReachableFrom
+    (start finish : Snapshot)
+    (hStart : ImageInvariant start)
+    (hReach : ReduceValidatedReachableFrom start finish) :
+    ImageInvariant finish := by
+  rcases hReach with ⟨events, hSupported, hFinish⟩
+  rw [← hFinish]
+  exact imageInvariant_reduceValidatedTrace_supported start events hStart hSupported
+
+theorem imageInvariant_of_stepReachableFrom
+    (start finish : Snapshot)
+    (hStart : ImageInvariant start)
+    (hReach : StepReachableFrom start finish) :
+    ImageInvariant finish := by
+  rcases hReach with ⟨events, hSupported, hFinish⟩
+  rw [← hFinish]
+  exact imageInvariant_stepTrace_supported start events hStart hSupported
+
+theorem imageInvariant_stepTrace_fromEmpty_supported
+    (events : List PeeringEvent)
+    (hSupported : StepTraceSupported ({} : Snapshot) events) :
+    ImageInvariant (stepTrace ({} : Snapshot) events) := by
+  exact imageInvariant_stepTrace_supported ({} : Snapshot) events imageInvariant_empty hSupported
+
+theorem imageInvariant_of_stepReachableFromEmpty
+    (finish : Snapshot)
+    (hReach : StepReachableFrom ({} : Snapshot) finish) :
+    ImageInvariant finish := by
+  exact imageInvariant_of_stepReachableFrom ({} : Snapshot) finish imageInvariant_empty hReach
 
 end Peering

@@ -341,6 +341,88 @@ theorem mem_support_of_lookupLength_pos (image : ObjectImage) {obj : ObjectId} :
   intro hPos
   exact (List.mem_eraseDups).2 (mem_keys_of_lookupLengthEntries_pos hPos)
 
+theorem lookupLengthEntries_le_of_forall {entries : List (ObjectId × Length)}
+    {obj : ObjectId} {bound : Length}
+    (hBound : ∀ {len}, (obj, len) ∈ entries → len ≤ bound) :
+    lookupLengthEntries obj entries ≤ bound := by
+  induction entries with
+  | nil =>
+      simp [lookupLengthEntries]
+  | cons head tail ih =>
+      cases head with
+      | mk obj' len =>
+          by_cases hEq : obj' = obj
+          · cases hEq
+            have hHead : len ≤ bound := hBound (by simp)
+            have hTail :
+                ∀ {len'}, (obj, len') ∈ tail → len' ≤ bound := by
+              intro len' hMem
+              exact hBound (by simp [hMem])
+            have hTailLe := ih hTail
+            simpa [lookupLengthEntries] using (Nat.max_le.2 ⟨hHead, hTailLe⟩)
+          · have hTail :
+                ∀ {len'}, (obj, len') ∈ tail → len' ≤ bound := by
+              intro len' hMem
+              exact hBound (by simp [hMem])
+            simpa [lookupLengthEntries, hEq] using ih hTail
+
+theorem lookupLength_clampImageTo (auth image : ObjectImage) (obj : ObjectId) :
+    lookupLength (clampImageTo auth image) obj =
+      min (lookupLength auth obj) (lookupLength image obj) := by
+  let bound := min (lookupLength auth obj) (lookupLength image obj)
+  apply Nat.le_antisymm
+  · unfold lookupLength clampImageTo
+    apply lookupLengthEntries_le_of_forall
+    intro len hMem
+    rcases (List.mem_filterMap).1 hMem with ⟨obj', hObj', hSome⟩
+    by_cases hZero : min (lookupLength auth obj') (lookupLength image obj') = 0
+    · simp [hZero] at hSome
+    · simp [hZero] at hSome
+      rcases hSome with ⟨hObjEq, hLenEq⟩
+      cases hObjEq
+      cases hLenEq
+      exact Nat.le_refl _
+  · by_cases hZero : bound = 0
+    · have hLe : 0 ≤ lookupLength (clampImageTo auth image) obj := Nat.zero_le _
+      simp [bound, hZero] at hLe ⊢
+    · have hBoundPos : 0 < bound := Nat.pos_of_ne_zero hZero
+      have hImagePos : 0 < lookupLength image obj := by
+        exact Nat.lt_of_lt_of_le hBoundPos (Nat.min_le_right _ _)
+      have hEntry :
+          (obj, bound) ∈ (clampImageTo auth image).entries := by
+        unfold clampImageTo
+        apply (List.mem_filterMap).2
+        refine ⟨obj, mem_support_of_lookupLength_pos image hImagePos, ?_⟩
+        simp [bound, hZero]
+      simpa [lookupLength, bound] using lookupLengthEntries_ge_of_mem hEntry
+
+theorem prefixImage_trans (lhs mid rhs : ObjectImage) :
+    prefixImage lhs mid → prefixImage mid rhs → prefixImage lhs rhs := by
+  intro hLeft hRight obj
+  exact Nat.le_trans (hLeft obj) (hRight obj)
+
+theorem prefixImage_clampImageTo_left (auth image : ObjectImage) :
+    prefixImage (clampImageTo auth image) auth := by
+  intro obj
+  rw [lookupLength_clampImageTo]
+  exact Nat.min_le_left _ _
+
+theorem prefixImage_clampImageTo_right (auth image : ObjectImage) :
+    prefixImage (clampImageTo auth image) image := by
+  intro obj
+  rw [lookupLength_clampImageTo]
+  exact Nat.min_le_right _ _
+
+theorem sameImage_clampImageTo_of_prefix
+    (auth image : ObjectImage)
+    (hPrefix : prefixImage image auth) :
+    sameImage (clampImageTo auth image) image := by
+  constructor
+  · exact prefixImage_clampImageTo_right auth image
+  · intro obj
+    rw [lookupLength_clampImageTo]
+    simp [Nat.min_eq_right (hPrefix obj)]
+
 theorem mem_keys_of_lookupAuthorityEntries_pos
     {entries : List (ObjectId × ObjectAuthority)} {obj : ObjectId} :
     0 < (lookupAuthorityEntries obj entries).authorityLength →

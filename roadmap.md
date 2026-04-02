@@ -167,17 +167,19 @@ Idris status:
 
 ### In progress
 
-- widening one-step preservation from the first proved handlers to the rest of
-  the current `lean-core` subset
-- theorem-friendly helper lemmas around authority, activation, and
-  recovery-plan recomputation
-- preparing the first reachable-state / trace-level theorem layer on top of the
-  supported reducer surface
+- proving soundness bridges from executable replay/check booleans back to Lean
+  propositions, especially for `snapshotImageInvariant?`
+- lifting the supported trace layer into cleaner replay-facing reachable-state
+  statements
+- starting the first replay/refinement theorems on top of the current supported
+  reducer and trace surface
 
 ### Not done yet
 
-- explicit Lean invariants over reachable semantic state
-- one-step preservation proofs for the remaining `lean-core` handlers
+- checker-soundness theorems from executable invariant checks back to
+  proof-facing propositions
+- stronger reachable-state reasoning that is not phrased through explicit
+  supported-trace witnesses
 - refinement/simulation theorems
 
 ## Lean Scope Right Now
@@ -202,12 +204,11 @@ The next concrete milestone is:
 
 - keep replay green on the current reduced semantic projection, including
   `AdvanceMap`
-- extend one-step preservation from the current proved subset to the remaining
-  `lean-core` handlers
-- keep the theorem surface aligned at the handler, `reduceValidated`, and
-  `step` boundaries
-- start the first reachable-state / trace-level theorem layer once that subset
-  is covered
+- prove soundness of the executable invariant checks back to
+  `ImageInvariant`
+- preserve the theorem surface at the handler, `reduceValidated`, `step`, and
+  supported-trace boundaries
+- start replay/refinement lemmas on top of the supported trace layer
 
 The first event subset should stay small:
 
@@ -220,7 +221,8 @@ The first event subset should stay small:
 - `RecoveryComplete`
 - `AllReplicasRecovered`
 
-This subset is now replay-checked in Lean under the `lean-core` profile.
+This subset is now replay-checked in Lean under the `lean-core` profile, and
+the reduced proof MVP is in place for that surface.
 
 `AdvanceMap` is now part of the replay-checked Lean reducer and the current
 supported preservation surface because interval changes and `min_size` logic
@@ -255,17 +257,30 @@ Immediately after that, add prefix-order properties for the explicit PG
 journal.
 
 That reduced invariant layer now exists as executable checks and propositions
-in [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean). The next proof work is to show preservation across the current small reducer subset rather than broadening the invariant statement first.
+in [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean).
 
-The first preservation layer now covers:
+The supported preservation layer now covers:
 
+- `Initialize`
 - `PeerInfoReceived`
 - `PeerQueryTimeout`
+- `UpThruUpdated`
+- `ActivateCommitted`
+- `RecoveryComplete`
+- `AllReplicasRecovered`
 - `AdvanceMap`
 
-and it is lifted through the handler, `reduceValidated`, and `step` boundaries.
-The next proof work is to extend that coverage to the remaining `lean-core`
-handlers before moving on to reachable-state reasoning.
+and it covers the replay-driven replica-side handlers under snapshot-sensitive
+support conditions:
+
+- `ReplicaActivate`
+- `ReplicaRecoveryComplete`
+
+That surface is lifted through the handler, `reduceValidated`, and `step`
+boundaries, and now also through supported trace execution from both the empty
+start snapshot and initialize-headed traces. The next proof work is no longer
+finishing the reduced MVP; it is proving checker soundness and beginning the
+replay/refinement layer.
 
 ## Replay Strategy
 
@@ -316,6 +331,10 @@ The first successful Lean version should provide:
 - machine-checked image-safety proofs
 - a clean reduced snapshot for replay comparison
 - a path toward trace-level refinement against the C++ implementation
+
+That reduced proof MVP is now achieved. The remaining work is to connect the
+executable checks back to the propositions cleanly and then lift the current
+proof surface into replay/refinement theorems.
 
 The standard is:
 

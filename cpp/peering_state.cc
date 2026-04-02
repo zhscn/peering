@@ -1270,13 +1270,7 @@ PeeringStateMachine::decide_recovery_complete(
   decision.kind = RecoveryProgressDecisionKind::Progress;
   decision.completed_peers.insert(e.peer);
   decision.update_local_to_auth = (e.peer == whoami_);
-
-  std::set<osd_id_t> completed = recovered_;
-  completed.insert(e.peer);
-  if (completed == image_recovery_targets()) {
-    decision.kind = RecoveryProgressDecisionKind::Clean;
-    decision.clean_reason = "all replicas recovered";
-  }
+  decision.clean_reason = "all replicas recovered";
 
   return decision;
 }
@@ -1308,7 +1302,7 @@ PeeringStateMachine::decide_all_replicas_recovered(
     return decision;
   }
 
-  decision.kind = RecoveryProgressDecisionKind::Clean;
+  decision.kind = RecoveryProgressDecisionKind::Progress;
   decision.update_local_to_auth = true;
   decision.clean_reason = "all replicas recovered (batch)";
   return decision;
@@ -1335,12 +1329,12 @@ void PeeringStateMachine::apply_recovery_progress_decision(
     local_info_.committed_seq = auth_seq_;
     local_info_.committed_length = primary_length(auth_image_);
   }
-  refresh_recovery_plans_from_current_authority();
+  // Recovery progress can change source tie-breaking for the remaining gaps,
+  // so recompute the full authority view before rebuilding plans.
+  refresh_image_state_from_known_peers();
 
-  if (decision.kind == RecoveryProgressDecisionKind::Clean) {
+  if (decision.clean_reason != nullptr && image_recovery_targets().empty()) {
     // Once recovery is complete, this bookkeeping is no longer live.
-    peer_recovery_plans_.clear();
-    local_recovery_plan_.clear();
     recovered_.clear();
     transition_to(State::Clean, decision.clean_reason, fx);
     fx.push_back(effect::MarkClean{.pgid = pgid_});

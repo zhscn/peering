@@ -27,6 +27,7 @@ class FailureRecord:
     replayer_returncode: int
     cross_validate_stderr: str
     replayer_stderr: str
+    failure_reason: str | None
     trace_path: str | None
 
 
@@ -90,6 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild",
         action="store_true",
         help="Rebuild cross_validate and peering-replay before fuzzing.",
+    )
+    parser.add_argument(
+        "--require-cpp-image-invariant",
+        action="store_true",
+        help=(
+            "Fail a cycle if any JSONL step reports "
+            "after_checks.image_invariant = false."
+        ),
     )
     return parser
 
@@ -162,6 +171,7 @@ def run_cycle(
     cross_validate: Path,
     replayer: Path,
     failure_dir: Path | None,
+    require_cpp_image_invariant: bool,
 ) -> tuple[bool, FailureRecord | None]:
     cross_validate_cmd = [
         str(cross_validate),
@@ -188,7 +198,28 @@ def run_cycle(
         check=False,
     )
 
-    success = cross_validate_result.returncode == 0 and replayer_result.returncode == 0
+    failure_reason = None
+    if require_cpp_image_invariant:
+        for line in trace.splitlines():
+            if not line.startswith("{"):
+                continue
+            record = json.loads(line)
+            if record.get("kind") != "step":
+                continue
+            after_checks = record.get("after_checks", {})
+            if after_checks.get("image_invariant") is False:
+                failure_reason = (
+                    "cpp image invariant failed at "
+                    f"step={record.get('step')} "
+                    f"event={record.get('event', {}).get('type')}"
+                )
+                break
+
+    success = (
+        cross_validate_result.returncode == 0
+        and replayer_result.returncode == 0
+        and failure_reason is None
+    )
     if success:
         return True, None
 
@@ -207,6 +238,7 @@ def run_cycle(
         replayer_returncode=replayer_result.returncode,
         cross_validate_stderr=cross_validate_result.stderr,
         replayer_stderr=replayer_result.stderr,
+        failure_reason=failure_reason,
         trace_path=trace_path,
     )
 
@@ -224,6 +256,8 @@ def report_failures(failures: Sequence[FailureRecord]) -> None:
         )
         if failure.trace_path is not None:
             print(f"  trace: {failure.trace_path}")
+        if failure.failure_reason is not None:
+            print(f"  reason: {failure.failure_reason}")
         if failure.cross_validate_stderr.strip():
             print("  cross_validate stderr:")
             for line in failure.cross_validate_stderr.strip().splitlines():
@@ -329,6 +363,7 @@ def main() -> int:
             cross_validate=cross_validate,
             replayer=replayer,
             failure_dir=args.save_failure_traces,
+            require_cpp_image_invariant=args.require_cpp_image_invariant,
         )
         if ok:
             print("  ok", flush=True)
