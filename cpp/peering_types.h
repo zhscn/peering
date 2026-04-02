@@ -183,6 +183,10 @@ using PeeringEvent =
 namespace effect {
 
 // Ask a peer for its image summary. Replaces Ceph's pg_query_t(INFO).
+// Runtime contract:
+// - Deliver to the target for the current peering epoch.
+// - Completion is represented by exactly one follow-up reducer event:
+//   `PeerInfoReceived` or `PeerQueryTimeout`.
 struct SendQuery {
   osd_id_t target;
   pg_id_t pgid;
@@ -190,6 +194,8 @@ struct SendQuery {
 };
 
 // Tell a peer about our state. Replaces Ceph's pg_notify_t.
+// Best-effort state advertisement. The reducer does not wait for an ack, so
+// dropping this effect only hurts convergence/observability, not local safety.
 struct SendNotify {
   osd_id_t target;
   pg_id_t pgid;
@@ -198,6 +204,14 @@ struct SendNotify {
 };
 
 // Activate a replica. Replaces the MOSDPGLog activation message.
+// Contract for senders/runtime:
+// - `auth_info`, `auth_sources`, and `authoritative_seq` must come from one
+//   fresh authority computation on the primary. Do not mix cached fields from
+//   different snapshots.
+// - Lean's replica-side invariant proofs assume this message is internally
+//   consistent with the primary's latest `known_peer_images()` view.
+// - The reducer has fallback decoding paths for compatibility, but production
+//   senders should populate every field explicitly and preserve them exactly.
 struct SendActivate {
   osd_id_t target;
   pg_id_t pgid;
@@ -208,6 +222,9 @@ struct SendActivate {
 };
 
 // PG is now active, start serving IO.
+// The runtime should start the local IO-facing role for this PG using the
+// supplied authoritative snapshot; do not synthesize a different authority
+// view locally.
 struct ActivatePG {
   pg_id_t pgid;
   journal_seq_t authoritative_seq;
@@ -217,12 +234,20 @@ struct ActivatePG {
 };
 
 // Stop serving IO on this PG.
+// This should quiesce client-visible activation before later recovery/delete
+// side effects are acted on.
 struct DeactivatePG {
   pg_id_t pgid;
 };
 
 // Schedule recovery: push data to short replicas.
 // The runtime decides concurrency, bandwidth, and priority.
+// Contract for executors:
+// - Each `ObjRecovery` describes an exact byte interval
+//   `[from_length, to_length)` for one object under the authority snapshot
+//   that produced this effect.
+// - Recovery IO must cover every listed interval completely before reporting
+//   `RecoveryComplete` / `AllReplicasRecovered`; these ranges are not hints.
 struct ScheduleRecovery {
   pg_id_t pgid;
   struct Target {
@@ -237,32 +262,46 @@ struct ScheduleRecovery {
 };
 
 // Cancel ongoing recovery.
+// Executors should suppress any later recovery-complete callbacks derived from
+// canceled work; if that is impossible, they must at least ensure stale
+// completions are tagged so reducer epoch guards can reject them.
 struct CancelRecovery {
   pg_id_t pgid;
 };
 
 // PG is now clean (all replicas caught up).
+// External bookkeeping may mark the PG clean only after the caller has honored
+// all preceding recovery/persistence effects for this transition.
 struct MarkClean {
   pg_id_t pgid;
 };
 
 // Persist PG metadata to durable storage.
+// Durability barrier: the runtime must not feed the next peering event back
+// into the reducer until this metadata is durably committed (for example,
+// after fsync / transaction commit).
 struct PersistState {
   pg_id_t pgid;
   PGInfo info;
 };
 
 // Request up_thru update from the monitor.
+// The caller must later feed `UpThruUpdated{epoch}` back into the reducer for
+// the same epoch once the monitor-side update is durable/visible.
 struct RequestUpThru {
   epoch_t epoch;
 };
 
 // Update heartbeat peer set.
+// Caller should update transport/liveness tracking to this exact peer set for
+// the current interval.
 struct UpdateHeartbeats {
   std::vector<osd_id_t> peers;
 };
 
 // Publish PG stats to the monitor.
+// Observability/reporting effect only; it should reflect the reducer output
+// exactly and must not mutate reducer-controlled state.
 struct PublishStats {
   pg_id_t pgid;
   State state;
@@ -276,18 +315,24 @@ struct PublishStats {
 };
 
 // Request that this PG be deleted.
+// After this succeeds, normal peering traffic should stop for the old
+// instance; re-entry should happen through a fresh `Initialize`.
 struct DeletePG {
   pg_id_t pgid;
 };
 
 // Request acting set change (Ceph's pg_temp). Tells the monitor
 // that the current acting set is suboptimal and should be changed.
+// Caller must not apply the new acting set locally on its own; it must wait
+// for the corresponding `AdvanceMap`.
 struct RequestActingChange {
   pg_id_t pgid;
   std::vector<osd_id_t> want_acting; // desired acting set
 };
 
 // State transition log (for observability).
+// Purely diagnostic. Runtimes may forward or persist it, but must not derive
+// reducer state from it.
 struct LogTransition {
   pg_id_t pgid;
   State from;
@@ -304,6 +349,10 @@ using PeeringEffect =
                  effect::MarkClean, effect::PersistState, effect::RequestUpThru,
                  effect::RequestActingChange, effect::UpdateHeartbeats,
                  effect::PublishStats, effect::DeletePG, effect::LogTransition>;
+// The returned effect vector is an ordered execution contract. A runtime may
+// perform the underlying IO asynchronously, but it must preserve reducer
+// causality and honor stronger per-effect requirements such as the
+// `PersistState` durability barrier before delivering later events.
 
 // A validated event has stale/epoch checks applied before reducer dispatch.
 using ValidatedEvent = PeeringEvent;
@@ -319,7 +368,8 @@ struct StepResult {
 
 // Apply epoch-guard rules to one raw input event.
 // Returns `std::nullopt` when the event is stale for the provided `reset`
-// epoch.
+// epoch. Additional per-event guards still apply inside the decision helpers;
+// for example `PeerInfoReceived` also requires an allowed sender.
 std::optional<ValidatedEvent> validate_event(epoch_t reset,
                                              const PeeringEvent &event);
 

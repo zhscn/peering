@@ -37,6 +37,15 @@ public:
 
   // Process an event and return the effects to execute.
   // Pure function from the caller's perspective: no internal IO.
+  // Runtime contract:
+  // - `process()` / `step()` are the safe entry points for raw events because
+  //   they apply stale-message guards before dispatch.
+  // - `process_validated()` assumes the caller already applied the same guard
+  //   rules and should only be used at reducer boundaries that preserve that
+  //   invariant.
+  // - The returned effect list is ordered program output; async runtimes may
+  //   overlap work, but they must preserve the reducer's causal contract and
+  //   the per-effect durability requirements documented in `peering_types.h`.
   std::vector<PeeringEffect> process(const PeeringEvent &event);
   // Pure two-phase step API for roadmap alignment:
   // validate first, then reduce.
@@ -227,6 +236,13 @@ private:
     const char *reason = nullptr;
   };
 
+  // `Initialize` is always processed. It resets all interval-local peering
+  // state, installs the supplied map/local metadata, and then chooses one of:
+  // - `StartPrimary`: transition into primary peering startup
+  // - `BecomeReplicaStray`: transition to `Stray` as an acting replica
+  // - `BecomeStray`: transition to `Stray` outside acting
+  // Effects: always `UpdateHeartbeats`; primary initialization may also emit
+  // `SendQuery` and later primary-side transitions.
   InitializeDecision decide_initialize(const event::Initialize &e) const;
   void apply_initialize_decision(Effects &fx,
                                  const InitializeDecision &decision);
@@ -243,6 +259,15 @@ private:
     PeerInfo info;
   };
 
+  // `PeerInfoReceived` is processed only when:
+  // - the sender is in `peers_queried_`, `acting_`, `up_`, or `prior_osds_`,
+  // - and `query_epoch` is zero or not older than `last_peering_reset_`.
+  // Otherwise it is ignored.
+  //
+  // In `GetPeerInfo`, accepted replies either just update peer state
+  // (`StoreOnly`) or also trigger `choose_acting()` once enough info is
+  // present. In `Down`/`Incomplete`/`WaitUpThru`, accepted replies are stored
+  // and immediately re-run `choose_acting()` so peering can recover.
   PeerInfoReceivedDecision
   decide_peer_info_received(const event::PeerInfoReceived &e) const;
   void
@@ -275,6 +300,15 @@ private:
     const char *reason = nullptr;
   };
 
+  // `AdvanceMap` is always processed. Depending on interval and pool-parameter
+  // changes it may:
+  // - publish only,
+  // - update pool params only,
+  // - retry `choose_acting()`,
+  // - transition to `Down` for a tighter `min_size`,
+  // - or restart peering as primary / replica stray / stray.
+  // Restart paths may emit `CancelRecovery`, `DeactivatePG`,
+  // `UpdateHeartbeats`, and then the usual peering-start effects.
   AdvanceMapDecision decide_advance_map(const event::AdvanceMap &e) const;
   void apply_advance_map_decision(Effects &fx,
                                   const AdvanceMapDecision &decision);
@@ -290,6 +324,10 @@ private:
     osd_id_t peer = -1;
   };
 
+  // `PeerQueryTimeout` matters only in `GetPeerInfo`; otherwise it is ignored.
+  // Callers should emit it only for outstanding `SendQuery` targets. Accepted
+  // timeouts mark the peer as responded+timed_out so peering can either keep
+  // waiting or continue conservatively via `choose_acting()`.
   PeerQueryTimeoutDecision
   decide_peer_query_timeout(const event::PeerQueryTimeout &e) const;
   void
@@ -301,14 +339,22 @@ private:
     bool cancel_recovery = false;
   };
 
+  // `DeleteStart` is always processed. It transitions to `Deleting` and emits
+  // `DeactivatePG` / `CancelRecovery` first when needed, then `DeletePG`.
   DeleteStartDecision decide_delete_start() const;
   void apply_delete_start_decision(Effects &fx,
                                    const DeleteStartDecision &decision);
+  // `DeleteComplete` is currently a reducer no-op. After `DeletePG`
+  // succeeds, callers should stop routing normal peering events for the old
+  // instance and only re-enter through a fresh `Initialize`.
 
   struct UpThruDecision {
     bool proceed = false;
   };
 
+  // `UpThruUpdated` is processed only in `WaitUpThru` and only for the exact
+  // current epoch. Otherwise it is ignored. Success clears `need_up_thru_`,
+  // may advance local interval history, and then calls `try_activate()`.
   UpThruDecision decide_up_thru_updated(const event::UpThruUpdated &e) const;
   void apply_up_thru_decision(Effects &fx, const UpThruDecision &decision);
 
@@ -316,6 +362,9 @@ private:
     bool persist_activation = false;
   };
 
+  // `ActivateCommitted` is meaningful only while the PG is active-ish
+  // (`Active` / `Recovering` / `Clean` / `ReplicaActive`). Otherwise it is
+  // ignored. Success flips `activated_` and emits `PersistState`.
   ActivateCommittedDecision decide_activate_committed() const;
   void
   apply_activate_committed_decision(Effects &fx,
@@ -342,8 +391,20 @@ private:
   };
 
   // Extract a pure acting-set decision before mutating state.
+  // Requires the current peer census already stored in the reducer.
+  // It recomputes authority/recovery plans and then chooses one of:
+  // - `Incomplete` / `Down`
+  // - `NeedActingChange`
+  // - `NeedUpThru`
+  // - `Activate`
+  // Transition/effect consequences are applied by `apply_acting_decision()`.
   ActingDecision decide_acting() const;
   // Apply a precomputed acting-set decision.
+  // Effects:
+  // - `PublishStats` on `Incomplete` / `Down`
+  // - `RequestActingChange` while waiting for a future `AdvanceMap`
+  // - `RequestUpThru` + transition to `WaitUpThru`
+  // - `try_activate()` on `Activate`
   void apply_acting_decision(Effects &fx, const ActingDecision &decision);
 
   enum class ActivationDecisionKind {
@@ -362,8 +423,16 @@ private:
   };
 
   // Extract a pure activation/recovery decision before mutating state.
+  // Preconditions: invoked only after authority/recovery plans were already
+  // chosen. It may refuse activation (`None`), send the PG `Down`, or classify
+  // the post-activation state as `Recovering` vs `Clean`.
   ActivationDecision decide_activation() const;
   // Apply a precomputed activation/recovery decision.
+  // Transitions:
+  // - `Down`
+  // - `Active`
+  // - optionally immediately to `Recovering` or `Clean`
+  // Effects are the ordered activation contract documented on `try_activate()`.
   void apply_activation_decision(Effects &fx,
                                  const ActivationDecision &decision);
 
@@ -380,8 +449,15 @@ private:
     const char *clean_reason = nullptr;
   };
 
+  // `RecoveryComplete` is processed only in `Recovering`, only for fresh
+  // epochs, and only for actual image-recovery targets. Otherwise it is
+  // ignored. Accepted completions update recovered bookkeeping and may finish
+  // the PG as `Clean`.
   RecoveryProgressDecision
   decide_recovery_complete(const event::RecoveryComplete &e) const;
+  // `AllReplicasRecovered` is processed only in `Recovering` or `Active`, only
+  // for fresh epochs, and only when every listed peer is still a current
+  // recovery target and the batch exactly covers the remaining targets.
   RecoveryProgressDecision
   decide_all_replicas_recovered(const event::AllReplicasRecovered &e) const;
   void
@@ -402,6 +478,17 @@ private:
     bool advance_history = false;
   };
 
+  // `ReplicaActivate` is processed only when:
+  // - local state is `Stray` or `ReplicaActive`,
+  // - self is in the acting set,
+  // - sender is the acting primary,
+  // - `activation_epoch` matches the current epoch
+  //   (stale/future raw events are already filtered by `validate_event()`).
+  // Otherwise it is ignored.
+  //
+  // Proof-side support assumption: `auth_info` / `auth_sources` /
+  // `authoritative_seq` come from one fresh primary-side authority
+  // computation, not a stale cached activation message.
   ReplicaActivationDecision
   decide_replica_activation(const event::ReplicaActivate &e) const;
   void
@@ -420,24 +507,45 @@ private:
     epoch_t activation_epoch = 0;
   };
 
+  // `ReplicaRecoveryComplete` is processed only in `ReplicaActive` and only if
+  // it preserves monotonic local progress/history and stays within the current
+  // installed authority. Otherwise it is ignored.
+  //
+  // Proof-side support assumption: the installed replica authority came from a
+  // consistent `SendActivate` generated from the primary's latest authority
+  // computation.
   ReplicaRecoveryDecision decide_replica_recovery_complete(
       const event::ReplicaRecoveryComplete &e) const;
   void apply_replica_recovery_decision(Effects &fx,
                                        const ReplicaRecoveryDecision &decision);
 
   // Choose objectwise authority and determine acting/recovery plans.
+  // Internal orchestration step reached after peer census changes.
   void choose_acting(Effects &fx);
 
   // Try to activate the PG (transition to Active).
+  // Successful activation emits the effect contract that async runtimes must
+  // implement faithfully:
+  // - `SendActivate` for each acting replica with the exact chosen authority
+  //   snapshot,
+  // - `ActivatePG`,
+  // - `PersistState`,
+  // - `PublishStats`,
+  // - and optionally `ScheduleRecovery` if any target is still short.
   void try_activate(Effects &fx);
 
   // Emit PersistState effect for current state.
+  // Callers must treat this as a durability barrier before feeding later
+  // peering events back into the reducer.
   void persist(Effects &fx);
 
   // Emit PublishStats effect.
+  // Reporting-only effect; must not feed state back into the reducer.
   void publish_stats(Effects &fx);
 
   // Clear peering-specific state for a new interval.
+  // Keeps local durable PG metadata but drops interval-local peering,
+  // authority, and recovery bookkeeping.
   void reset_peering_state();
 };
 

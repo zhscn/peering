@@ -190,6 +190,10 @@ recovery_targets_from_plans(const std::vector<PeerRecoveryPlan> &peer_plans,
 
 std::optional<ValidatedEvent> validate_event(epoch_t reset,
                                              const PeeringEvent &event) {
+  // First-line stale-message filter. Event-specific membership / state guards
+  // still live in the individual decision helpers, so callers should route raw
+  // input through `validate_event()` and the matching `decide_*` logic rather
+  // than bypassing one of them.
   return std::visit(
       [=](const auto &e) -> std::optional<ValidatedEvent> {
         using T = std::decay_t<decltype(e)>;
@@ -597,6 +601,15 @@ PeeringStateMachine::decide_peer_info_received(
     const event::PeerInfoReceived &e) const {
   PeerInfoReceivedDecision decision;
 
+  // Processing preconditions for `PeerInfoReceived`:
+  // - sender must be one we queried, or currently be in acting/up/prior_osds_;
+  //   otherwise the event is ignored.
+  // - `query_epoch` is ignored when it is non-zero and older than
+  //   `last_peering_reset_`.
+  // This is the C++ counterpart of Lean's `peerInfoReceivedAllowed` plus
+  // `isFreshEpoch`; omitting either guard lets the reducer ingest replies from
+  // a peering interval it should no longer trust.
+
   // Fix (round 12): Reject replies from OSDs we never probed or that
   // aren't in acting/up/prior sets.
   if (!peers_queried_.contains(e.from) && !acting_.contains(e.from) &&
@@ -949,9 +962,9 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
   decision.auth_seq = authoritative_committed_seq(known_peers);
   decision.auth_sources = authoritative_sources(known_peers);
   decision.auth_image = authority_image_values(decision.auth_sources);
-  decision.peer_recovery_plans = build_peer_recovery_plans(
-      decision.auth_sources, decision.auth_seq,
-      acting_replica_images(acting_, whoami_, peers));
+  decision.peer_recovery_plans =
+      build_peer_recovery_plans(decision.auth_sources, decision.auth_seq,
+                                acting_replica_images(acting_, whoami_, peers));
   decision.local_recovery_plan =
       pg_image_recovery_plan(decision.auth_sources, local);
 
@@ -997,8 +1010,7 @@ PeeringStateMachine::ActingDecision PeeringStateMachine::decide_acting() const {
 
   auto is_complete_peer = [&](osd_id_t osd) {
     auto it = peers.find(osd);
-    return it != peers.end() &&
-           it->second.committed_seq >= decision.auth_seq &&
+    return it != peers.end() && it->second.committed_seq >= decision.auth_seq &&
            same_image(effective_image(it->second), decision.auth_image);
   };
 
@@ -1196,6 +1208,18 @@ void PeeringStateMachine::apply_activation_decision(
   // Transition to Active.
   transition_to(State::Active, "peering complete", fx);
 
+  // Effect execution contract for runtimes around `try_activate()`:
+  // - `SendActivate` must carry the exact authority snapshot chosen above.
+  //   Forward it faithfully; do not re-derive or partially fill fields from
+  //   external caches.
+  // - `ActivatePG` authorizes local IO against that same authoritative view.
+  // - `PersistState` is a durability barrier before the next peering event is
+  //   delivered back into the reducer.
+  // - `PublishStats` reports the post-transition state.
+  // - If `ScheduleRecovery` follows, each listed `ObjRecovery` range is exact
+  //   and recovery IO must cover every byte interval before completion is
+  //   reported back.
+
   // Activate replicas.
   for (auto osd : decision.activate_replicas) {
     PeerInfo auth_info;
@@ -1348,6 +1372,14 @@ PeeringStateMachine::decide_replica_activation(
     const event::ReplicaActivate &e) const {
   ReplicaActivationDecision decision;
 
+  // Supported invariant assumption for replica-side handlers:
+  // the primary must build `SendActivate` from one fresh authority snapshot.
+  // In particular, `e.auth_info`, `e.auth_sources`, and
+  // `e.authoritative_seq` are expected to match the primary's latest
+  // `known_peer_images()`-derived authority, not cached older data.
+  // The reducer keeps compatibility fallbacks for sparse messages, but the
+  // proved contract assumes the fully populated, internally consistent form.
+
   if (state_ != State::Stray && state_ != State::ReplicaActive)
     return decision;
 
@@ -1365,13 +1397,15 @@ PeeringStateMachine::decide_replica_activation(
   decision.kind = ReplicaActivationDecisionKind::Activate;
   decision.auth_seq =
       e.authoritative_seq > 0 ? e.authoritative_seq : auth_info.committed_seq;
-  decision.auth_sources = !e.auth_sources.empty() ? e.auth_sources
-                                                  : authority_from_peer_info(auth_info);
+  decision.auth_sources = !e.auth_sources.empty()
+                              ? e.auth_sources
+                              : authority_from_peer_info(auth_info);
   decision.auth_image = !decision.auth_sources.empty()
                             ? authority_image_values(decision.auth_sources)
                             : auth_info.image;
   decision.activation_epoch = e.activation_epoch;
-  decision.advance_history = decision.auth_seq <= local_info_.committed_seq &&
+  decision.advance_history =
+      decision.auth_seq <= local_info_.committed_seq &&
       prefix_image(decision.auth_image, effective_image(local_info_));
   return decision;
 }
@@ -1409,6 +1443,12 @@ PeeringStateMachine::ReplicaRecoveryDecision
 PeeringStateMachine::decide_replica_recovery_complete(
     const event::ReplicaRecoveryComplete &e) const {
   ReplicaRecoveryDecision decision;
+
+  // Supported invariant assumption: this handler runs under the authority
+  // state installed by a consistent `SendActivate` from the primary. In other
+  // words, `auth_image_` / `auth_sources_` / `auth_seq_` are assumed to come
+  // from the latest primary-side authority computation rather than stale
+  // cached activation data.
 
   if (state_ != State::ReplicaActive)
     return decision;
@@ -1508,9 +1548,9 @@ PeeringStateMachine::Snapshot PeeringStateMachine::snapshot() const {
   auto auth_sources = auth_sources_;
   auto peer_recovery_plans = peer_recovery_plans_;
   auto local_recovery_plan = local_recovery_plan_;
-  std::set<osd_id_t> recovery_targets = recovery_targets_from_plans(
-      peer_recovery_plans, local_recovery_plan, local_info.committed_seq,
-      auth_seq_, whoami_);
+  std::set<osd_id_t> recovery_targets =
+      recovery_targets_from_plans(peer_recovery_plans, local_recovery_plan,
+                                  local_info.committed_seq, auth_seq_, whoami_);
   std::set<osd_id_t> recovered = recovered_;
   if (state_ == State::Clean) {
     recovery_targets.clear();

@@ -28,10 +28,10 @@
 #include <string_view>
 #include <vector>
 
+#include <CLI/CLI.hpp>
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 #include <glaze/glaze.hpp>
-#include <CLI/CLI.hpp>
 
 #include "peering_state.h"
 
@@ -433,8 +433,7 @@ static auto to_peer_info_views(const std::map<osd_id_t, PeerInfo> &infos)
 
 // ── Glaze serialization ─────────────────────────────────────────────
 
-template <typename T>
-static auto to_json_str(const T &value) -> std::string {
+template <typename T> static auto to_json_str(const T &value) -> std::string {
   std::string buf;
   [[maybe_unused]] auto ec = glz::write_json(value, buf);
   return buf;
@@ -475,8 +474,7 @@ static auto to_snapshot_view(const PeeringStateMachine::Snapshot &snap)
 
 // ── Event / Effect JSON serialization ───────────────────────────────
 
-template <typename... Ts>
-struct overloaded : Ts... {
+template <typename... Ts> struct overloaded : Ts... {
   using Ts::operator()...;
 };
 
@@ -641,8 +639,8 @@ static auto effect_to_json(const PeeringEffect &fx) -> std::string {
             });
           },
           [](const effect::CancelRecovery &f) {
-            return to_json_str(CancelRecoveryTagged{
-                .type = "CancelRecovery", .pgid = f.pgid});
+            return to_json_str(
+                CancelRecoveryTagged{.type = "CancelRecovery", .pgid = f.pgid});
           },
           [](const effect::MarkClean &f) {
             return to_json_str(
@@ -841,10 +839,9 @@ static bool snapshot_image_clean(const PeeringStateMachine::Snapshot &snap) {
 static bool
 snapshot_image_recovering(const PeeringStateMachine::Snapshot &snap) {
   bool peer_seq_lag =
-      std::ranges::any_of(acting_replica_images(snap),
-                          [&](const PeerInfo &p) {
-                            return p.committed_seq < snap.auth_seq;
-                          });
+      std::ranges::any_of(acting_replica_images(snap), [&](const PeerInfo &p) {
+        return p.committed_seq < snap.auth_seq;
+      });
   return snapshot_image_invariant(snap) && !snapshot_image_clean(snap) &&
          (!snap.peer_recovery_plans.empty() ||
           !snap.local_recovery_plan.empty() ||
@@ -880,7 +877,8 @@ struct EventGenerator {
   TestConfig cfg;
   EventProfile profile;
 
-  explicit EventGenerator(uint64_t seed, EventProfile profile = EventProfile::Full)
+  explicit EventGenerator(uint64_t seed,
+                          EventProfile profile = EventProfile::Full)
       : rng(seed), profile(profile) {}
 
   TestConfig gen_config() {
@@ -888,8 +886,7 @@ struct EventGenerator {
     c.num_osds = std::uniform_int_distribution<int>(2, 5)(rng);
     c.pool_size =
         std::uniform_int_distribution<int>(2, std::min(c.num_osds, 3))(rng);
-    c.pool_min_size =
-        std::uniform_int_distribution<int>(1, c.pool_size)(rng);
+    c.pool_min_size = std::uniform_int_distribution<int>(1, c.pool_size)(rng);
     c.current_epoch = 10;
     std::vector<osd_id_t> all_osds;
     for (int i = 0; i < c.num_osds; i++)
@@ -897,24 +894,22 @@ struct EventGenerator {
     std::ranges::shuffle(all_osds, rng);
     c.initial_acting.assign(
         all_osds.begin(),
-        all_osds.begin() + std::min(static_cast<int>(all_osds.size()),
-                                    c.pool_size));
+        all_osds.begin() +
+            std::min(static_cast<int>(all_osds.size()), c.pool_size));
     c.whoami = c.initial_acting[0];
     return c;
   }
 
   event::Initialize gen_initialize() {
     cfg = gen_config();
-    uint64_t local_len =
-        std::uniform_int_distribution<uint64_t>(0, 200)(rng);
+    uint64_t local_len = std::uniform_int_distribution<uint64_t>(0, 200)(rng);
     return event::Initialize{
         .pgid = 1,
         .whoami = cfg.whoami,
         .epoch = cfg.current_epoch,
-        .acting = ActingSet{.osds = cfg.initial_acting,
-                            .epoch = cfg.current_epoch},
-        .up = ActingSet{.osds = cfg.initial_acting,
-                        .epoch = cfg.current_epoch},
+        .acting =
+            ActingSet{.osds = cfg.initial_acting, .epoch = cfg.current_epoch},
+        .up = ActingSet{.osds = cfg.initial_acting, .epoch = cfg.current_epoch},
         .pool_size = cfg.pool_size,
         .pool_min_size = cfg.pool_min_size,
         .local_info =
@@ -1114,15 +1109,13 @@ struct EventGenerator {
     }
   }
 
-  event::AdvanceMap
-  gen_advance_map(const PeeringStateMachine::Snapshot &snap) {
+  event::AdvanceMap gen_advance_map(const PeeringStateMachine::Snapshot &snap) {
     epoch_t new_epoch = snap.epoch + 1;
     cfg.current_epoch = new_epoch;
-    bool new_interval =
-        std::uniform_int_distribution<int>(0, 9)(rng) < 4;
-    auto new_acting_osds =
-        new_interval ? random_acting_set()
-                     : std::vector<osd_id_t>(snap.acting.osds);
+    bool new_interval = std::uniform_int_distribution<int>(0, 9)(rng) < 4;
+    auto new_acting_osds = new_interval
+                               ? random_acting_set()
+                               : std::vector<osd_id_t>(snap.acting.osds);
     int new_pool_size = snap.pool_size;
     int new_pool_min_size = snap.pool_min_size;
     if (std::uniform_int_distribution<int>(0, 9)(rng) == 0) {
@@ -1130,8 +1123,7 @@ struct EventGenerator {
           std::uniform_int_distribution<int>(1, new_pool_size)(rng);
     }
     std::vector<osd_id_t> prior;
-    if (new_interval &&
-        std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
+    if (new_interval && std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
       int n = std::uniform_int_distribution<int>(1, 2)(rng);
       for (int i = 0; i < n; i++)
         prior.push_back(random_osd());
@@ -1243,8 +1235,7 @@ struct EventGenerator {
         .auth_info =
             PeerInfo{
                 .osd = from,
-                .committed_seq =
-                    snap.auth_seq > 0 ? snap.auth_seq : len,
+                .committed_seq = snap.auth_seq > 0 ? snap.auth_seq : len,
                 .committed_length = len,
                 .image = snap.auth_image.empty() ? primary_image(len)
                                                  : snap.auth_image,
@@ -1256,8 +1247,8 @@ struct EventGenerator {
     };
   }
 
-  event::ReplicaRecoveryComplete gen_replica_recovery_complete(
-      const PeeringStateMachine::Snapshot &snap) {
+  event::ReplicaRecoveryComplete
+  gen_replica_recovery_complete(const PeeringStateMachine::Snapshot &snap) {
     uint64_t len = snap.auth_length;
     if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
       len = std::uniform_int_distribution<uint64_t>(0, 300)(rng);
@@ -1273,8 +1264,8 @@ struct EventGenerator {
     return event::ReplicaRecoveryComplete{
         .new_committed_seq = seq,
         .new_committed_length = len,
-        .recovered_image = snap.auth_image.empty() ? primary_image(len)
-                                                   : snap.auth_image,
+        .recovered_image =
+            snap.auth_image.empty() ? primary_image(len) : snap.auth_image,
         .activation_epoch = ep,
     };
   }
@@ -1340,14 +1331,12 @@ static void print_event(const PeeringEvent &ev) {
             fmt::print("local_image ");
             print_object_image(effective_image(e.local_info));
             fmt::print("\n");
-            fmt::print("local_committed_seq {}\n",
-                       e.local_info.committed_seq);
+            fmt::print("local_committed_seq {}\n", e.local_info.committed_seq);
             fmt::print("last_epoch_started {}\n",
                        e.local_info.last_epoch_started);
             fmt::print("last_interval_started {}\n",
                        e.local_info.last_interval_started);
-            fmt::print("last_epoch_clean {}\n",
-                       e.local_info.last_epoch_clean);
+            fmt::print("last_epoch_clean {}\n", e.local_info.last_epoch_clean);
             print_osd_list("prior_osds ", e.prior_osds);
           },
           [](const event::AdvanceMap &e) {
@@ -1366,8 +1355,7 @@ static void print_event(const PeeringEvent &ev) {
             print_object_image(effective_image(e.info));
             fmt::print("\n");
             fmt::print("peer_committed_seq {}\n", e.info.committed_seq);
-            fmt::print("last_epoch_started {}\n",
-                       e.info.last_epoch_started);
+            fmt::print("last_epoch_started {}\n", e.info.last_epoch_started);
             fmt::print("query_epoch {}\n", e.query_epoch);
           },
           [](const event::PeerQueryTimeout &e) {
@@ -1397,8 +1385,7 @@ static void print_event(const PeeringEvent &ev) {
             fmt::print("peer_image ");
             print_object_image(effective_image(e.auth_info));
             fmt::print("\n");
-            fmt::print("peer_committed_seq {}\n",
-                       e.auth_info.committed_seq);
+            fmt::print("peer_committed_seq {}\n", e.auth_info.committed_seq);
             fmt::print("authoritative_seq {}\n", e.authoritative_seq);
             fmt::print("last_epoch_started {}\n",
                        e.auth_info.last_epoch_started);
@@ -1427,8 +1414,7 @@ static void print_event(const PeeringEvent &ev) {
   fmt::print("---\n");
 }
 
-static void
-print_peer_image_lines(const std::map<osd_id_t, PeerInfo> &infos) {
+static void print_peer_image_lines(const std::map<osd_id_t, PeerInfo> &infos) {
   for (const auto &[osd, info] : infos) {
     fmt::print("peer_image {} ", osd);
     print_object_image(effective_image(info));
@@ -1490,8 +1476,7 @@ static void print_state(const PeeringStateMachine::Snapshot &snap) {
              snap.local_info.last_epoch_started);
   fmt::print("local_last_interval_started {}\n",
              snap.local_info.last_interval_started);
-  fmt::print("local_last_epoch_clean {}\n",
-             snap.local_info.last_epoch_clean);
+  fmt::print("local_last_epoch_clean {}\n", snap.local_info.last_epoch_clean);
   fmt::print("auth_seq {}\n", snap.auth_seq);
   fmt::print("auth_image ");
   print_object_image(snap.auth_image);
@@ -1521,16 +1506,12 @@ static void print_state(const PeeringStateMachine::Snapshot &snap) {
   fmt::print("\n");
   fmt::print("need_up_thru {}\n", snap.need_up_thru ? 1 : 0);
   fmt::print("activated {}\n", snap.activated ? 1 : 0);
-  fmt::print("pending_acting_change {}\n",
-             snap.pending_acting_change ? 1 : 0);
+  fmt::print("pending_acting_change {}\n", snap.pending_acting_change ? 1 : 0);
   fmt::print("last_peering_reset {}\n", snap.last_peering_reset);
-  fmt::print("have_enough_info {}\n",
-             snapshot_have_enough_info(snap) ? 1 : 0);
-  fmt::print("image_invariant {}\n",
-             snapshot_image_invariant(snap) ? 1 : 0);
+  fmt::print("have_enough_info {}\n", snapshot_have_enough_info(snap) ? 1 : 0);
+  fmt::print("image_invariant {}\n", snapshot_image_invariant(snap) ? 1 : 0);
   fmt::print("image_clean {}\n", snapshot_image_clean(snap) ? 1 : 0);
-  fmt::print("image_recovering {}\n",
-             snapshot_image_recovering(snap) ? 1 : 0);
+  fmt::print("image_recovering {}\n", snapshot_image_recovering(snap) ? 1 : 0);
   fmt::print("---\n");
 }
 
@@ -1572,7 +1553,8 @@ int main(int argc, char *argv[]) {
 
   CLI::App app{"Cross-validation driver for peering state machine"};
   app.add_option("--seed", seed, "Random seed")->default_val(42);
-  app.add_option("--events", num_events, "Max events per trace")->default_val(30);
+  app.add_option("--events", num_events, "Max events per trace")
+      ->default_val(30);
   app.add_option("--format", format_str, "Output format: jsonl|legacy")
       ->default_val("jsonl")
       ->check(CLI::IsMember({"jsonl", "legacy"}));
@@ -1584,14 +1566,14 @@ int main(int argc, char *argv[]) {
 
   OutputFormat format =
       (format_str == "legacy") ? OutputFormat::Legacy : OutputFormat::Jsonl;
-  EventProfile profile =
-      (profile_str == "lean-core") ? EventProfile::LeanCore : EventProfile::Full;
+  EventProfile profile = (profile_str == "lean-core") ? EventProfile::LeanCore
+                                                      : EventProfile::Full;
 
-  fmt::print(stderr,
-             "Cross-validation driver: seed={} events={} format={} profile={}\n",
-             seed, num_events,
-             format == OutputFormat::Jsonl ? "jsonl" : "legacy",
-             profile == EventProfile::LeanCore ? "lean-core" : "full");
+  fmt::print(
+      stderr,
+      "Cross-validation driver: seed={} events={} format={} profile={}\n", seed,
+      num_events, format == OutputFormat::Jsonl ? "jsonl" : "legacy",
+      profile == EventProfile::LeanCore ? "lean-core" : "full");
 
   int total_events = 0;
   EventGenerator gen(seed, profile);

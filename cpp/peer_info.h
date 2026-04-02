@@ -211,8 +211,8 @@ inline bool same_image(const ObjectImage &lhs, const ObjectImage &rhs) {
   return prefix_image(lhs, rhs) && prefix_image(rhs, lhs);
 }
 
-inline std::vector<ObjRecovery> image_recovery_gaps(const ObjectImage &local,
-                                                    const AuthorityImage &auth) {
+inline std::vector<ObjRecovery>
+image_recovery_gaps(const ObjectImage &local, const AuthorityImage &auth) {
   std::vector<ObjRecovery> gaps;
   for (const auto &[obj, source] : auth) {
     auto auth_len = source.authority_length;
@@ -290,8 +290,8 @@ peer_image_recovery_plan(const AuthorityImage &auth, const PeerInfo &peer) {
   return image_recovery_gaps(effective_image(peer), auth);
 }
 
-inline std::vector<ObjRecovery> pg_image_recovery_plan(const AuthorityImage &auth,
-                                                       const PGInfo &pg) {
+inline std::vector<ObjRecovery>
+pg_image_recovery_plan(const AuthorityImage &auth, const PGInfo &pg) {
   return image_recovery_gaps(effective_image(pg), auth);
 }
 
@@ -324,9 +324,7 @@ struct ActingSet {
 
   osd_id_t primary() const { return osds.empty() ? -1 : osds[0]; }
   int size() const { return static_cast<int>(osds.size()); }
-  bool contains(osd_id_t osd) const {
-    return std::ranges::contains(osds, osd);
-  }
+  bool contains(osd_id_t osd) const { return std::ranges::contains(osds, osd); }
 };
 
 } // namespace vermilion::peering
