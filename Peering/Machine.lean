@@ -1,6 +1,9 @@
+import Std.Data.TreeMap
 import Peering.Image
 
 namespace Peering
+
+abbrev PeerInfoMap := Std.TreeMap OsdId PeerInfo compare
 
 structure Snapshot where
   state : State := .initial
@@ -15,7 +18,7 @@ structure Snapshot where
   authSeq : JournalSeq := 0
   authImage : ObjectImage := {}
   authSources : AuthorityImage := {}
-  peerInfo : List (OsdId × PeerInfo) := []
+  peerInfo : PeerInfoMap := {}
   peersQueried : List OsdId := []
   peersResponded : List OsdId := []
   priorOsds : List OsdId := []
@@ -27,7 +30,7 @@ structure Snapshot where
   activated : Bool := false
   pendingActingChange : Bool := false
   lastPeeringReset : Epoch := 0
-  deriving DecidableEq, Repr
+  deriving Repr
 
 structure SnapshotStepResult where
   before : Snapshot
@@ -35,7 +38,7 @@ structure SnapshotStepResult where
   fromState : State
   toState : State
   effects : List PeeringEffect
-  deriving DecidableEq, Repr
+  deriving Repr
 
 namespace Snapshot
 
@@ -64,18 +67,25 @@ def osdSetEq (xs ys : List OsdId) : Bool :=
   boolAnd ((xs.eraseDups.map fun osd => decide (osd ∈ ys)) ++
     (ys.eraseDups.map fun osd => decide (osd ∈ xs)))
 
-def lookupPeerInfo : List (OsdId × PeerInfo) → OsdId → Option PeerInfo
-  | [], _ => none
-  | (key, value) :: rest, osd =>
-      if key = osd then some value else lookupPeerInfo rest osd
+def lookupPeerInfo (entries : PeerInfoMap) (osd : OsdId) : Option PeerInfo :=
+  entries.get? osd
 
-def insertPeerInfo (entries : List (OsdId × PeerInfo))
-    (osd : OsdId) (info : PeerInfo) : List (OsdId × PeerInfo) :=
-  (osd, info) :: entries.filter (fun entry => entry.1 ≠ osd)
+def insertPeerInfo (entries : PeerInfoMap)
+    (osd : OsdId) (info : PeerInfo) : PeerInfoMap :=
+  entries.insert osd info
 
-def upsertRecoveredPeerInfo (entries : List (OsdId × PeerInfo))
-    (osd : OsdId) (authSeq : JournalSeq) (authImage : ObjectImage) :
+def peerInfoEntriesSorted (entries : PeerInfoMap) :
     List (OsdId × PeerInfo) :=
+  entries.toList
+
+def normalizePeerInfoMap (entries : PeerInfoMap) : PeerInfoMap :=
+  entries.toList.foldl
+    (fun acc (osd, info) => acc.insert osd (normalizedPeerInfo info))
+    {}
+
+def upsertRecoveredPeerInfo (entries : PeerInfoMap)
+    (osd : OsdId) (authSeq : JournalSeq) (authImage : ObjectImage) :
+    PeerInfoMap :=
   let updated :=
     match lookupPeerInfo entries osd with
     | some info =>
@@ -117,7 +127,7 @@ def recoveryTargetsFromPlans (peerPlans : List PeerRecoveryPlan)
 
 def knownPeerImages (snap : Snapshot) : List PeerInfo :=
   let remote :=
-    snap.peerInfo.foldr
+    snap.peerInfo.toList.foldr
       (fun (entry : OsdId × PeerInfo) acc =>
         if entry.1 = snap.whoami then
           acc
@@ -233,7 +243,7 @@ def transitionTo (snap : Snapshot) (newState : State) (reason : String) :
 
 def resetPeeringState (snap : Snapshot) : Snapshot :=
   { snap with
-    peerInfo := []
+    peerInfo := {}
     peersQueried := []
     peersResponded := []
     priorOsds := []
@@ -368,7 +378,7 @@ def tryActivate (snap : Snapshot) : Snapshot × List PeeringEffect :=
 
 def chooseActing (snap : Snapshot) : Snapshot × List PeeringEffect :=
   let localInfo := normalizedPGInfo snap.localInfo
-  let peers := snap.peerInfo.map fun entry => (entry.1, normalizedPeerInfo entry.2)
+  let peers := normalizePeerInfoMap snap.peerInfo
   let known := knownPeerImages { snap with localInfo := localInfo, peerInfo := peers }
   if known.isEmpty then
     let (snap', fx) := transitionTo snap .incomplete "no valid peer info"

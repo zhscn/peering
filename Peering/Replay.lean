@@ -11,7 +11,7 @@ structure SnapshotChecks where
   imageInvariant : Bool
   imageClean : Bool
   imageRecovering : Bool
-  deriving DecidableEq, Repr
+  deriving Repr
 
 structure ReplayStep where
   step : Nat
@@ -23,26 +23,26 @@ structure ReplayStep where
   after : Snapshot
   afterChecks : SnapshotChecks
   effects : List PeeringEffect
-  deriving DecidableEq, Repr
+  deriving Repr
 
 structure ReplaySummary where
   seed : Nat
   events : Nat
-  deriving DecidableEq, Repr
+  deriving Repr
 
 inductive ReplayLine
   | step (line : ReplayStep)
   | summary (line : ReplaySummary)
-  deriving DecidableEq, Repr
+  deriving Repr
 
 structure ReplayCursor where
   current : Snapshot := {}
-  deriving DecidableEq, Repr
+  deriving Repr
 
 structure ReplayStats where
   steps : Nat := 0
   summaries : Nat := 0
-  deriving DecidableEq, Repr
+  deriving Repr
 
 def insertSortedByRepr [Repr α] (item : α) : List α → List α
   | [] => [item]
@@ -76,12 +76,17 @@ def normalizePeerInfo (info : PeerInfo) : PeerInfo :=
 def normalizePGInfoReplay (info : PGInfo) : PGInfo :=
   { info with image := normalizeObjectImage info.image }
 
+def normalizePeerInfoMapReplay (entries : PeerInfoMap) : PeerInfoMap :=
+  entries.toList.foldl
+    (fun acc (osd, info) => acc.insert osd (normalizePeerInfo info))
+    {}
+
 def normalizeSnapshot (snap : Snapshot) : Snapshot :=
   { snap with
     localInfo := normalizePGInfoReplay snap.localInfo
     authImage := normalizeObjectImage snap.authImage
     authSources := normalizeAuthorityImage snap.authSources
-    peerInfo := normalizeByRepr (snap.peerInfo.map fun (osd, info) => (osd, normalizePeerInfo info))
+    peerInfo := normalizePeerInfoMapReplay snap.peerInfo
     peersQueried := normalizeByRepr snap.peersQueried
     peersResponded := normalizeByRepr snap.peersResponded
     priorOsds := normalizeByRepr snap.priorOsds
@@ -180,6 +185,10 @@ def parseSnapshotChecks (json : Json) : Except String SnapshotChecks := do
 
 def parseSnapshot (json : Json) : Except String Snapshot := do
   let peerInfos ← parseList (← json.getObjVal? "peer_info") parsePeerInfo
+  let peerInfo :=
+    peerInfos.foldl
+      (fun acc info => acc.insert info.osd info)
+      ({} : PeerInfoMap)
   pure {
     state := ← parseStateName (← json.getObjValAs? String "state")
     pgid := ← json.getObjValAs? PgId "pgid"
@@ -193,7 +202,7 @@ def parseSnapshot (json : Json) : Except String Snapshot := do
     authSeq := ← json.getObjValAs? JournalSeq "auth_seq"
     authImage := ← parseObjectImage (← json.getObjVal? "auth_image")
     authSources := ← parseAuthorityImage (← json.getObjVal? "auth_sources")
-    peerInfo := peerInfos.map fun info => (info.osd, info)
+    peerInfo := peerInfo
     peersQueried := ← json.getObjValAs? (List OsdId) "peers_queried"
     peersResponded := ← json.getObjValAs? (List OsdId) "peers_responded"
     priorOsds := ← json.getObjValAs? (List OsdId) "prior_osds"
@@ -429,13 +438,13 @@ def parseReplayLines (input : String) : Except String (List ReplayLine) := do
 def compareReplayStep (expected : ReplayStep) (actual : SnapshotStepResult) : Except String Unit := do
   let expectedBefore := normalizeSnapshot expected.before
   let actualBefore := normalizeSnapshot actual.before
-  if actualBefore ≠ expectedBefore then
+  if reprStr actualBefore ≠ reprStr expectedBefore then
     throw s!"before snapshot mismatch at step {expected.step}\nexpected: {reprStr expectedBefore}\nactual: {reprStr actualBefore}"
   if actual.fromState ≠ expected.fromState then
     throw s!"from-state mismatch at step {expected.step}\nexpected: {reprStr expected.fromState}\nactual: {reprStr actual.fromState}"
   let expectedAfter := normalizeSnapshot expected.after
   let actualAfter := normalizeSnapshot actual.after
-  if actualAfter ≠ expectedAfter then
+  if reprStr actualAfter ≠ reprStr expectedAfter then
     throw s!"after snapshot mismatch at step {expected.step}\nexpected: {reprStr expectedAfter}\nactual: {reprStr actualAfter}"
   if actual.toState ≠ expected.toState then
     throw s!"to-state mismatch at step {expected.step}\nexpected: {reprStr expected.toState}\nactual: {reprStr actual.toState}"
@@ -447,7 +456,7 @@ def compareReplayStep (expected : ReplayStep) (actual : SnapshotStepResult) : Ex
 def replayObservedStep (cursor : ReplayCursor) (entry : ReplayStep) : Except String ReplayCursor := do
   let expectedBefore := normalizeSnapshot entry.before
   let actualBefore := normalizeSnapshot cursor.current
-  if actualBefore ≠ expectedBefore then
+  if reprStr actualBefore ≠ reprStr expectedBefore then
     throw s!"input snapshot mismatch before step {entry.step}\ntrace: {reprStr expectedBefore}\nreplayed: {reprStr actualBefore}"
   let actual := step cursor.current entry.event
   compareReplayStep entry actual
