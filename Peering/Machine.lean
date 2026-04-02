@@ -208,6 +208,30 @@ def haveEnoughInfo (snap : Snapshot) : Bool :=
       else
         true)
 
+def peerInfoReceivedEnoughInfo (snap : Snapshot) (sender : OsdId) : Bool :=
+  boolAnd (snap.peersQueried.map fun osd =>
+    if osd = sender then true else decide (osd ∈ snap.peersResponded)) &&
+  boolAnd (snap.acting.osds.map fun osd =>
+    if osdNonneg osd && osd ≠ snap.whoami && osd ≠ sender then
+      decide (osd ∈ snap.peersResponded)
+    else
+      true)
+
+def peerInfoReceivedAllowed (snap : Snapshot) (sender : OsdId) : Bool :=
+  decide (sender ∈ snap.peersQueried) ||
+    snap.acting.contains sender ||
+    snap.up.contains sender ||
+    decide (sender ∈ snap.priorOsds)
+
+def peerQueryTimeoutEnoughInfo (snap : Snapshot) (peer : OsdId) : Bool :=
+  boolAnd (snap.peersQueried.map fun osd =>
+    if osd = peer then true else decide (osd ∈ snap.peersResponded)) &&
+  boolAnd (snap.acting.osds.map fun osd =>
+    if osdNonneg osd && osd ≠ snap.whoami && osd ≠ peer then
+      decide (osd ∈ snap.peersResponded)
+    else
+      true)
+
 def effectPersist (snap : Snapshot) : PeeringEffect :=
   .persistState {
     pgid := snap.pgid
@@ -269,74 +293,86 @@ def sendQueries (snap : Snapshot) : Snapshot × List PeeringEffect :=
          accFx ++ [.sendQuery { target := osd, pgid := accSnap.pgid, epoch := accSnap.epoch }]))
     (snap, [])
 
+def tryActivateAvailable (snap : Snapshot) : Nat :=
+  snap.acting.osds.foldl
+    (fun count osd =>
+      if osdNonneg osd && (lookupPeerInfo snap.peerInfo osd).isSome then
+        count + 1
+      else
+        count)
+    0
+
+def tryActivateClampLocalToAuth (snap : Snapshot) : Bool :=
+  snap.localInfo.committedSeq >= snap.authSeq &&
+    prefixImage? snap.authImage (effectivePGImage snap.localInfo)
+
+def tryActivatePeerTargets (snap : Snapshot) : List Effect.RecoveryTarget :=
+  snap.peerRecoveryPlans.map fun plan =>
+    let peerLength :=
+      match lookupPeerInfo snap.peerInfo plan.target with
+      | some info => primaryLength (effectivePeerImage info)
+      | none => 0
+    let peerSeq :=
+      match lookupPeerInfo snap.peerInfo plan.target with
+      | some info => info.committedSeq
+      | none => 0
+    {
+      osd := plan.target
+      peerLength := peerLength
+      authoritativeLength := primaryLength snap.authImage
+      peerCommittedSeq := peerSeq
+      authoritativeSeq := snap.authSeq
+      recoveries := plan.recoveries
+    }
+
+def tryActivateLocalTargets (snap : Snapshot) : List Effect.RecoveryTarget :=
+  if snap.localRecoveryPlan.isEmpty && snap.localInfo.committedSeq >= snap.authSeq then
+    []
+  else
+    [{
+      osd := snap.whoami
+      peerLength := primaryLength (effectivePGImage snap.localInfo)
+      authoritativeLength := primaryLength snap.authImage
+      peerCommittedSeq := snap.localInfo.committedSeq
+      authoritativeSeq := snap.authSeq
+      recoveries := snap.localRecoveryPlan
+    }]
+
+def tryActivateRecoveryTargets (snap : Snapshot) : List Effect.RecoveryTarget :=
+  tryActivatePeerTargets snap ++ tryActivateLocalTargets snap
+
+def tryActivateLocalInfo (snap : Snapshot) : PGInfo :=
+  let updated := {
+    snap.localInfo with
+      lastEpochStarted := snap.epoch
+      lastIntervalStarted := snap.epoch
+  }
+  if tryActivateClampLocalToAuth snap then
+    {
+      updated with
+        image := snap.authImage
+        committedSeq := snap.authSeq
+        committedLength := primaryLength snap.authImage
+    }
+  else
+    updated
+
+def tryActivatePreparedSnap (snap : Snapshot) : Snapshot :=
+  refreshImageStateFromKnownPeers { snap with localInfo := tryActivateLocalInfo snap }
+
 def tryActivate (snap : Snapshot) : Snapshot × List PeeringEffect :=
   if snap.pendingActingChange then
     (snap, [])
   else
-    let available :=
-      snap.acting.osds.foldl
-        (fun count osd =>
-          if osdNonneg osd && (lookupPeerInfo snap.peerInfo osd).isSome then
-            count + 1
-          else
-            count)
-        0
+    let available := tryActivateAvailable snap
     if available < snap.poolMinSize then
       let (snap', fx) := transitionTo snap .down "min_size check failed at activation"
       (snap', fx ++ [effectPublishStats snap'])
     else
-      let clampLocalToAuth :=
-        snap.localInfo.committedSeq >= snap.authSeq &&
-          prefixImage? snap.authImage (effectivePGImage snap.localInfo)
       let activateReplicas :=
         snap.acting.osds.filter (fun osd => osdNonneg osd && osd ≠ snap.whoami)
-      let peerTargets :=
-        snap.peerRecoveryPlans.map fun plan =>
-          let peerLength :=
-            match lookupPeerInfo snap.peerInfo plan.target with
-            | some info => primaryLength (effectivePeerImage info)
-            | none => 0
-          let peerSeq :=
-            match lookupPeerInfo snap.peerInfo plan.target with
-            | some info => info.committedSeq
-            | none => 0
-          {
-            osd := plan.target
-            peerLength := peerLength
-            authoritativeLength := primaryLength snap.authImage
-            peerCommittedSeq := peerSeq
-            authoritativeSeq := snap.authSeq
-            recoveries := plan.recoveries
-          }
-      let localTargets :=
-        if snap.localRecoveryPlan.isEmpty && snap.localInfo.committedSeq >= snap.authSeq then
-          []
-        else
-          [{
-            osd := snap.whoami
-            peerLength := primaryLength (effectivePGImage snap.localInfo)
-            authoritativeLength := primaryLength snap.authImage
-            peerCommittedSeq := snap.localInfo.committedSeq
-            authoritativeSeq := snap.authSeq
-            recoveries := snap.localRecoveryPlan
-          }]
-      let recoveryTargets := peerTargets ++ localTargets
-      let localInfo :=
-        let updated := {
-          snap.localInfo with
-            lastEpochStarted := snap.epoch
-            lastIntervalStarted := snap.epoch
-        }
-        if clampLocalToAuth then
-          {
-            updated with
-              image := snap.authImage
-              committedSeq := snap.authSeq
-              committedLength := primaryLength snap.authImage
-          }
-        else
-          updated
-      let snap := refreshRecoveryPlansFromCurrentAuthority { snap with localInfo := localInfo }
+      let recoveryTargets := tryActivateRecoveryTargets snap
+      let snap := tryActivatePreparedSnap snap
       let (snap, transitionFx) := transitionTo snap .active "peering complete"
       let activateFx := activateReplicas.map fun osd =>
         .sendActivate {
@@ -376,56 +412,73 @@ def tryActivate (snap : Snapshot) : Snapshot × List PeeringEffect :=
           targets := recoveryTargets
         }])
 
-def chooseActing (snap : Snapshot) : Snapshot × List PeeringEffect :=
+def prepareChooseActing (snap : Snapshot) : Snapshot :=
   let localInfo := normalizedPGInfo snap.localInfo
   let peers := normalizePeerInfoMap snap.peerInfo
-  let known := knownPeerImages { snap with localInfo := localInfo, peerInfo := peers }
+  refreshImageStateFromKnownPeers { snap with localInfo := localInfo, peerInfo := peers }
+
+def chooseActingPriorTimedOut (snap : Snapshot) : Bool :=
+  snap.timedOutProbes.any fun osd =>
+    decide (osd ∈ snap.priorOsds) && (lookupPeerInfo snap.peerInfo osd).isNone
+
+def chooseActingDesiredPrimary (snap : Snapshot) : OsdId :=
+  snap.acting.primary.getD snap.whoami
+
+def chooseActingPeerOrder (snap : Snapshot) : List OsdId :=
+  snap.acting.osds ++ snap.up.osds ++ snap.priorOsds
+
+def chooseActingAddPeer (snap : Snapshot)
+    (acc : List OsdId × List OsdId) (osd : OsdId) : List OsdId × List OsdId :=
+  let (want, inWant) := acc
+  if !osdNonneg osd || decide (osd ∈ inWant) || want.length >= snap.poolSize then
+    (want, inWant)
+  else if lookupPeerInfo snap.peerInfo osd |>.isNone then
+    (want, inWant)
+  else
+    (want ++ [osd], osdSetInsert inWant osd)
+
+def chooseActingIsCompletePeer (snap : Snapshot) (osd : OsdId) : Bool :=
+  match lookupPeerInfo snap.peerInfo osd with
+  | some info =>
+      decide (info.committedSeq >= snap.authSeq) &&
+        sameImage? (effectivePeerImage info) snap.authImage
+  | none => false
+
+def chooseActingSeedWant (snap : Snapshot) : List OsdId :=
+  [chooseActingDesiredPrimary snap]
+
+def chooseActingSeedSeen (snap : Snapshot) : List OsdId :=
+  [chooseActingDesiredPrimary snap]
+
+def chooseActingCompletePass (snap : Snapshot) : List OsdId × List OsdId :=
+  (chooseActingPeerOrder snap).foldl
+    (fun acc osd => if chooseActingIsCompletePeer snap osd then chooseActingAddPeer snap acc osd else acc)
+    (chooseActingSeedWant snap, chooseActingSeedSeen snap)
+
+def chooseActingWantActing (snap : Snapshot) : List OsdId :=
+  ((chooseActingPeerOrder snap).foldl (chooseActingAddPeer snap)
+    (chooseActingCompletePass snap)).1
+
+def chooseActingAvailable (snap : Snapshot) : Nat :=
+  (chooseActingWantActing snap).length
+
+def chooseActingNeedActingChange (snap : Snapshot) : Bool :=
+  (chooseActingWantActing snap).any fun osd => !(snap.acting.contains osd)
+
+def chooseActing (snap : Snapshot) : Snapshot × List PeeringEffect :=
+  let snap := prepareChooseActing snap
+  let known := knownPeerImages snap
   if known.isEmpty then
     let (snap', fx) := transitionTo snap .incomplete "no valid peer info"
     (snap', fx ++ [effectPublishStats snap'])
   else
-    let authSeq := authoritativeCommittedSeq known
-    let authSources := authoritativeSources known
-    let authImage := authorityImageValues authSources
-    let peerRecoveryPlans := buildPeerRecoveryPlans authSources authSeq
-      (actingReplicaImages { snap with peerInfo := peers })
-    let localRecoveryPlan := pgImageRecoveryPlan authSources localInfo
-    let snap := { snap with
-      authSeq := authSeq
-      authSources := authSources
-      authImage := authImage
-      peerRecoveryPlans := peerRecoveryPlans
-      localRecoveryPlan := localRecoveryPlan }
-    let priorTimedOut := snap.timedOutProbes.any fun osd =>
-      decide (osd ∈ snap.priorOsds) && (lookupPeerInfo snap.peerInfo osd).isNone
+    let priorTimedOut := chooseActingPriorTimedOut snap
     if priorTimedOut then
       let (snap', fx) := transitionTo snap .down "prior-interval probe timed out"
       (snap', fx ++ [effectPublishStats snap'])
     else
-      let desiredPrimary := snap.acting.primary.getD snap.whoami
-      let addPeer := fun (acc : List OsdId × List OsdId) (osd : OsdId) =>
-        let (want, inWant) := acc
-        if !osdNonneg osd || decide (osd ∈ inWant) || want.length >= snap.poolSize then
-          (want, inWant)
-        else if lookupPeerInfo snap.peerInfo osd |>.isNone then
-          (want, inWant)
-        else
-          (want ++ [osd], osdSetInsert inWant osd)
-      let isCompletePeer := fun (osd : OsdId) =>
-        match lookupPeerInfo snap.peerInfo osd with
-        | some info =>
-            info.committedSeq >= authSeq &&
-              sameImage? (effectivePeerImage info) authImage
-        | none => false
-      let seedWant : List OsdId := [desiredPrimary]
-      let seedSeen : List OsdId := [desiredPrimary]
-      let completePass :=
-        (snap.acting.osds ++ snap.up.osds ++ snap.priorOsds).foldl
-          (fun acc osd => if isCompletePeer osd then addPeer acc osd else acc)
-          (seedWant, seedSeen)
-      let (wantActing, _) :=
-        (snap.acting.osds ++ snap.up.osds ++ snap.priorOsds).foldl addPeer completePass
-      let available := wantActing.length
+      let wantActing := chooseActingWantActing snap
+      let available := chooseActingAvailable snap
       if available < snap.poolMinSize then
         if available = 0 then
           let (snap', fx) := transitionTo snap .incomplete "no peers available"
@@ -434,7 +487,7 @@ def chooseActing (snap : Snapshot) : Snapshot × List PeeringEffect :=
           let (snap', fx) := transitionTo snap .down "insufficient peers for min_size"
           (snap', fx ++ [effectPublishStats snap'])
       else
-        let needActingChange := wantActing.any fun osd => !(snap.acting.contains osd)
+        let needActingChange := chooseActingNeedActingChange snap
         if needActingChange then
           ({ snap with pendingActingChange := true }, [
             .requestActingChange { pgid := snap.pgid, wantActing := wantActing }
@@ -446,31 +499,50 @@ def chooseActing (snap : Snapshot) : Snapshot × List PeeringEffect :=
         else
           tryActivate { snap with pendingActingChange := false }
 
+def startPeeringPrimaryPrior (snap : Snapshot) (priorOsds : List OsdId) : List OsdId :=
+  priorOsds.foldl
+    (fun acc osd =>
+      if osdNonneg osd && osd ≠ snap.whoami then osdSetInsert acc osd else acc)
+    []
+
+def startPeeringPrimaryEntered (snap : Snapshot) (priorOsds : List OsdId) :
+    Snapshot × List PeeringEffect :=
+  transitionTo
+    { snap with priorOsds := startPeeringPrimaryPrior snap priorOsds }
+    .getPeerInfo
+    "start peering as primary"
+
+def startPeeringPrimarySelfInfo (snap : Snapshot) (priorOsds : List OsdId) : PeerInfo :=
+  let entered := (startPeeringPrimaryEntered snap priorOsds).1
+  {
+    osd := entered.whoami
+    committedSeq := entered.localInfo.committedSeq
+    committedLength := entered.localInfo.committedLength
+    image := effectivePGImage entered.localInfo
+    lastEpochStarted := entered.localInfo.lastEpochStarted
+    lastIntervalStarted := entered.localInfo.lastIntervalStarted
+  }
+
+def startPeeringPrimaryRefreshedSnap (snap : Snapshot) (priorOsds : List OsdId) : Snapshot :=
+  let entered := (startPeeringPrimaryEntered snap priorOsds).1
+  refreshImageStateFromKnownPeers {
+    entered with
+      peerInfo := insertPeerInfo
+        entered.peerInfo
+        entered.whoami
+        (startPeeringPrimarySelfInfo snap priorOsds)
+      peersResponded := osdSetInsert entered.peersResponded entered.whoami
+  }
+
+def startPeeringPrimaryQueried (snap : Snapshot) (priorOsds : List OsdId) :
+    Snapshot × List PeeringEffect :=
+  let entered := startPeeringPrimaryEntered snap priorOsds
+  let (queried, queryFx) := sendQueries (startPeeringPrimaryRefreshedSnap snap priorOsds)
+  (queried, entered.2 ++ queryFx)
+
 def startPeeringPrimary (snap : Snapshot) (priorOsds : List OsdId) :
     Snapshot × List PeeringEffect :=
-  let prior :=
-    priorOsds.foldl
-      (fun acc osd =>
-        if osdNonneg osd && osd ≠ snap.whoami then osdSetInsert acc osd else acc)
-      []
-  let (snap, transitionFx) := transitionTo { snap with priorOsds := prior }
-    .getPeerInfo "start peering as primary"
-  let selfInfo : PeerInfo := {
-    osd := snap.whoami
-    committedSeq := snap.localInfo.committedSeq
-    committedLength := snap.localInfo.committedLength
-    image := effectivePGImage snap.localInfo
-    lastEpochStarted := snap.localInfo.lastEpochStarted
-    lastIntervalStarted := snap.localInfo.lastIntervalStarted
-  }
-  let snap :=
-    refreshImageStateFromKnownPeers {
-      snap with
-        peerInfo := insertPeerInfo snap.peerInfo snap.whoami selfInfo
-        peersResponded := osdSetInsert snap.peersResponded snap.whoami
-    }
-  let (snap, queryFx) := sendQueries snap
-  let fx := transitionFx ++ queryFx
+  let (snap, fx) := startPeeringPrimaryQueried snap priorOsds
   if haveEnoughInfo snap then
     let (snap, chooseFx) := chooseActing snap
     (snap, fx ++ chooseFx)
@@ -501,37 +573,31 @@ def onInitialize (snap : Snapshot) (e : Event.Initialize) :
          else "initialize as stray")
   (snap, fx ++ [.updateHeartbeats { peers := snap.acting.osds }])
 
+def peerInfoReceivedInfo (e : Event.PeerInfoReceived) : PeerInfo :=
+  normalizedPeerInfo { e.info with osd := e.sender }
+
+def peerInfoReceivedRefreshedSnap (snap : Snapshot) (e : Event.PeerInfoReceived) : Snapshot :=
+  refreshImageStateFromKnownPeers {
+    snap with
+      peerInfo := insertPeerInfo snap.peerInfo e.sender (peerInfoReceivedInfo e)
+      peersResponded := osdSetInsert snap.peersResponded e.sender
+  }
+
 def onPeerInfoReceived (snap : Snapshot) (e : Event.PeerInfoReceived) :
     Snapshot × List PeeringEffect :=
-  let allowed :=
-    decide (e.sender ∈ snap.peersQueried) ||
-    snap.acting.contains e.sender ||
-    snap.up.contains e.sender ||
-    decide (e.sender ∈ snap.priorOsds)
+  let allowed := peerInfoReceivedAllowed snap e.sender
   if !allowed then
     (snap, [])
   else if e.queryEpoch > 0 && e.queryEpoch < snap.lastPeeringReset then
     (snap, [])
   else
-    let info := normalizedPeerInfo { e.info with osd := e.sender }
-    let snap := refreshImageStateFromKnownPeers {
-      snap with
-        peerInfo := insertPeerInfo snap.peerInfo e.sender info
-        peersResponded := osdSetInsert snap.peersResponded e.sender
-    }
+    let snap := peerInfoReceivedRefreshedSnap snap e
     if snap.state = .down || snap.state = .incomplete || snap.state = .waitUpThru then
       chooseActing snap
     else if snap.state ≠ .getPeerInfo then
       (snap, [])
     else
-      let enoughInfo :=
-        boolAnd (snap.peersQueried.map fun osd =>
-          if osd = e.sender then true else decide (osd ∈ snap.peersResponded)) &&
-        boolAnd (snap.acting.osds.map fun osd =>
-          if osdNonneg osd && osd ≠ snap.whoami && osd ≠ e.sender then
-            decide (osd ∈ snap.peersResponded)
-          else
-            true)
+      let enoughInfo := peerInfoReceivedEnoughInfo snap e.sender
       if enoughInfo then chooseActing snap else (snap, [])
 
 def onPeerQueryTimeout (snap : Snapshot) (e : Event.PeerQueryTimeout) :
@@ -539,14 +605,7 @@ def onPeerQueryTimeout (snap : Snapshot) (e : Event.PeerQueryTimeout) :
   if snap.state ≠ .getPeerInfo then
     (snap, [])
   else
-    let enoughInfo :=
-      boolAnd (snap.peersQueried.map fun osd =>
-        if osd = e.peer then true else decide (osd ∈ snap.peersResponded)) &&
-      boolAnd (snap.acting.osds.map fun osd =>
-        if osdNonneg osd && osd ≠ snap.whoami && osd ≠ e.peer then
-          decide (osd ∈ snap.peersResponded)
-        else
-          true)
+    let enoughInfo := peerQueryTimeoutEnoughInfo snap e.peer
     let snap := {
       snap with
         peersResponded := osdSetInsert snap.peersResponded e.peer
@@ -724,6 +783,108 @@ def onReplicaRecoveryComplete (snap : Snapshot)
       }
       (snap, [effectPersist snap, effectPublishStats snap])
 
+def advanceMapNewInterval (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  e.newActing.osds ≠ snap.acting.osds || e.newUp.osds ≠ snap.up.osds
+
+def advanceMapPoolParamsChanged (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  e.newPoolSize ≠ snap.poolSize || e.newPoolMinSize ≠ snap.poolMinSize
+
+def advanceMapNextIsPrimary (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  decide (e.newActing.primary = some snap.whoami)
+
+def advanceMapNextContainsSelf (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  e.newActing.contains snap.whoami
+
+def advanceMapAvailable (snap : Snapshot) (acting : ActingSet) : Nat :=
+  acting.osds.foldl
+    (fun available osd =>
+      if osdNonneg osd && (lookupPeerInfo snap.peerInfo osd).isSome then
+        available + 1
+      else
+        available)
+    0
+
+def advanceMapIntervalBase (snap : Snapshot) (e : Event.AdvanceMap) : Snapshot :=
+  { snap with epoch := e.newEpoch, acting := e.newActing, up := e.newUp }
+
+def advanceMapPoolBase (snap : Snapshot) (e : Event.AdvanceMap) : Snapshot :=
+  { advanceMapIntervalBase snap e with
+      poolSize := e.newPoolSize
+      poolMinSize := e.newPoolMinSize
+  }
+
+def advanceMapRestartBase (snap : Snapshot) (e : Event.AdvanceMap) : Snapshot :=
+  { resetPeeringState (advanceMapPoolBase snap e) with lastPeeringReset := e.newEpoch }
+
+def advanceMapRetryChooseActing (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  snap.pendingActingChange &&
+    advanceMapNextIsPrimary snap e &&
+      decide (snap.state = .getPeerInfo || snap.state = .waitUpThru)
+
+def advanceMapPoolChangePrimaryActive (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  advanceMapNextIsPrimary snap e && (advanceMapIntervalBase snap e).isActive
+
+def advanceMapPoolChangeBelowMinSize (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  decide (advanceMapAvailable snap e.newActing < e.newPoolMinSize)
+
+def advanceMapPoolChangeRetryChoose (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  advanceMapNextIsPrimary snap e &&
+    decide (snap.state = .down || snap.state = .incomplete) &&
+      decide (snap.poolMinSize > e.newPoolMinSize)
+
+def advanceMapMinSizeDecreased (snap : Snapshot) (e : Event.AdvanceMap) : Bool :=
+  decide (snap.poolMinSize > e.newPoolMinSize)
+
+def onAdvanceMap (snap : Snapshot) (e : Event.AdvanceMap) :
+    Snapshot × List PeeringEffect :=
+  let newInterval := advanceMapNewInterval snap e
+  let poolParamsChanged := advanceMapPoolParamsChanged snap e
+  let nextIsPrimary := advanceMapNextIsPrimary snap e
+  let nextContainsSelf := advanceMapNextContainsSelf snap e
+  let base := advanceMapIntervalBase snap e
+  if !newInterval && !poolParamsChanged then
+    if advanceMapRetryChooseActing snap e then
+      chooseActing base
+    else
+      (base, [effectPublishStats base])
+  else if !newInterval && poolParamsChanged then
+    if advanceMapPoolChangePrimaryActive snap e then
+      if advanceMapPoolChangeBelowMinSize snap e then
+        let base := advanceMapPoolBase snap e
+        let recoveryFx :=
+          if snap.state = .recovering then [.cancelRecovery { pgid := snap.pgid }] else []
+        let deactivateFx := [.deactivatePG { pgid := snap.pgid }]
+        let (base, transitionFx) := transitionTo base .down "min_size increased, insufficient peers"
+        let fx := recoveryFx ++ deactivateFx ++ transitionFx ++ [effectPublishStats base]
+        if advanceMapMinSizeDecreased snap e then
+          let (base, chooseFx) := chooseActing base
+          (base, fx ++ chooseFx)
+        else
+          (base, fx)
+      else if advanceMapPoolChangeRetryChoose snap e then
+        chooseActing (advanceMapPoolBase snap e)
+      else
+        (advanceMapPoolBase snap e, [])
+    else if advanceMapPoolChangeRetryChoose snap e then
+      chooseActing (advanceMapPoolBase snap e)
+    else
+      (advanceMapPoolBase snap e, [])
+  else
+    let base := advanceMapRestartBase snap e
+    let recoveryFx :=
+      if snap.state = .recovering then [.cancelRecovery { pgid := snap.pgid }] else []
+    let deactivateFx :=
+      if snap.isActive then [.deactivatePG { pgid := snap.pgid }] else []
+    let (base, fx) :=
+      if nextIsPrimary then
+        startPeeringPrimary base e.priorOsds
+      else
+        let base := refreshImageStateFromKnownPeers base
+        let reason :=
+          if nextContainsSelf then "new interval, replica" else "new interval, stray"
+        transitionTo base .stray reason
+    (base, recoveryFx ++ deactivateFx ++ fx ++ [.updateHeartbeats { peers := base.acting.osds }])
+
 def onDeleteStart (snap : Snapshot) : Snapshot × List PeeringEffect :=
   let baseFx :=
     (if snap.isActive then [.deactivatePG { pgid := snap.pgid }] else []) ++
@@ -735,6 +896,7 @@ def reduceValidated (snap : Snapshot) (event : ValidatedEvent) :
     Snapshot × List PeeringEffect :=
   match event with
   | .initialize e => onInitialize snap e
+  | .advanceMap e => onAdvanceMap snap e
   | .peerInfoReceived e => onPeerInfoReceived snap e
   | .peerQueryTimeout e => onPeerQueryTimeout snap e
   | .upThruUpdated e => onUpThruUpdated snap e
@@ -744,7 +906,7 @@ def reduceValidated (snap : Snapshot) (event : ValidatedEvent) :
   | .replicaActivate e => onReplicaActivate snap e
   | .replicaRecoveryComplete e => onReplicaRecoveryComplete snap e
   | .deleteStart _ => onDeleteStart snap
-  | .advanceMap _ | .deleteComplete _ => (snap, [])
+  | .deleteComplete _ => (snap, [])
 
 def isFreshEpoch (reset msgEpoch : Epoch) : Bool :=
   msgEpoch = 0 || msgEpoch >= reset

@@ -183,9 +183,12 @@ Future Lean work should treat ordering and image state as separate but linked:
 - `Types.lean` now has the first compact journal progress and source-aware
   recovery fields
 - `Image.lean` now has authority-based recovery-gap helpers
-- `Machine.lean` should next reason about validated events updating both journal
-  progress and image state
-- `Invariants.lean` should include both prefix-order and image-safety
-  invariants
+- `Machine.lean` now has the first executable reducer and replay-aligned
+  snapshot/effect boundary
+- `Invariants.lean` now includes the first image-safety and recovery-plan
+  invariants as executable checks and propositions
+- the next Lean proof step is widening preservation from the current proved
+  subset (`PeerInfoReceived`, `PeerQueryTimeout`, `AdvanceMap`) to the
+  remaining `lean-core` handlers
 - replay/refinement should compare a reduced semantic snapshot containing both
   committed prefix progress and derived image state

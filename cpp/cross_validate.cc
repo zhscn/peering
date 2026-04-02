@@ -1054,45 +1054,63 @@ struct EventGenerator {
     int choice = std::uniform_int_distribution<int>(0, 99)(rng);
     switch (snap.state) {
     case State::Initial:
-      return gen_peer_info_received(snap);
+      return gen_advance_map(snap);
     case State::GetPeerInfo:
-      if (choice < 70)
+      if (choice < 55)
         return gen_peer_info_received(snap);
-      return gen_peer_query_timeout(snap);
+      if (choice < 80)
+        return gen_peer_query_timeout(snap);
+      return gen_advance_map(snap);
     case State::WaitUpThru:
-      if (choice < 60)
+      if (choice < 45)
         return gen_up_thru_updated(snap);
-      return gen_peer_info_received(snap);
+      if (choice < 75)
+        return gen_peer_info_received(snap);
+      return gen_advance_map(snap);
     case State::Active:
-      if (choice < 40)
+      if (choice < 20)
+        return gen_advance_map(snap);
+      if (choice < 50)
         return event::ActivateCommitted{};
-      if (choice < 70)
+      if (choice < 75)
         return gen_all_replicas_recovered(snap);
       return gen_recovery_complete(snap);
     case State::Recovering:
-      if (choice < 50)
+      if (choice < 20)
+        return gen_advance_map(snap);
+      if (choice < 55)
         return gen_recovery_complete(snap);
-      if (choice < 75)
+      if (choice < 80)
         return gen_all_replicas_recovered(snap);
       return event::ActivateCommitted{};
     case State::Clean:
+      if (choice < 35)
+        return gen_advance_map(snap);
       return event::ActivateCommitted{};
     case State::Stray:
+      if (choice < 35)
+        return gen_advance_map(snap);
       return gen_replica_activate(snap);
     case State::ReplicaActive:
-      if (choice < 60)
+      if (choice < 20)
+        return gen_advance_map(snap);
+      if (choice < 68)
         return gen_replica_recovery_complete(snap);
       return gen_replica_activate(snap);
     case State::Down:
-      if (choice < 60)
+      if (choice < 45)
         return gen_peer_info_received(snap);
-      return gen_peer_query_timeout(snap);
+      if (choice < 75)
+        return gen_peer_query_timeout(snap);
+      return gen_advance_map(snap);
     case State::Incomplete:
-      return gen_peer_info_received(snap);
+      if (choice < 70)
+        return gen_peer_info_received(snap);
+      return gen_advance_map(snap);
     case State::Deleting:
       return event::DeleteComplete{};
     default:
-      return gen_peer_info_received(snap);
+      return gen_advance_map(snap);
     }
   }
 

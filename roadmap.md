@@ -144,6 +144,13 @@ Those modules are still useful mainly for:
   - JSONL parsing for `cross_validate` output,
   - step-by-step replay against the Lean reducer,
   - normalization for ordering noise in effects and set/map-like fields.
+- Lean now has an explicit first invariant layer in:
+  - [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean)
+  - executable invariant checks mirroring the current C++ replay checks,
+  - the first structural lemmas connecting clean/recovering checks back to the
+    base image invariant.
+- Lean `peerInfo` state is now stored in a deterministic `TreeMap`, so replay
+  and authority-source tie-breaking no longer depend on insertion history.
 - The repo now has a checked-in replay executable and CI path:
   - `peering-replay` validates JSONL traces from Lean,
   - GitHub Actions builds C++, builds Lean, generates a `lean-core` replay
@@ -160,13 +167,17 @@ Idris status:
 
 ### In progress
 
-- tightening the replay normalization boundary
-- deciding which independent semantic checks should be reimplemented in Lean
-- preparing the first explicit invariant layer over the executable reducer
+- widening one-step preservation from the first proved handlers to the rest of
+  the current `lean-core` subset
+- theorem-friendly helper lemmas around authority, activation, and
+  recovery-plan recomputation
+- preparing the first reachable-state / trace-level theorem layer on top of the
+  supported reducer surface
 
 ### Not done yet
 
 - explicit Lean invariants over reachable semantic state
+- one-step preservation proofs for the remaining `lean-core` handlers
 - refinement/simulation theorems
 
 ## Lean Scope Right Now
@@ -189,10 +200,14 @@ concerns into the core reducer too early.
 
 The next concrete milestone is:
 
-- tighten `Replay.lean` around the reduced semantic projection
-- reimplement the first independent semantic checks in Lean
-- define explicit invariants over reachable Lean snapshots
-- prove one meaningful image-safety preservation theorem
+- keep replay green on the current reduced semantic projection, including
+  `AdvanceMap`
+- extend one-step preservation from the current proved subset to the remaining
+  `lean-core` handlers
+- keep the theorem surface aligned at the handler, `reduceValidated`, and
+  `step` boundaries
+- start the first reachable-state / trace-level theorem layer once that subset
+  is covered
 
 The first event subset should stay small:
 
@@ -205,9 +220,12 @@ The first event subset should stay small:
 - `RecoveryComplete`
 - `AllReplicasRecovered`
 
-`AdvanceMap` should be added immediately after that first invariant/replay
-milestone because interval changes and `min_size` logic are where the model starts to
-interact with more realistic peering control flow.
+This subset is now replay-checked in Lean under the `lean-core` profile.
+
+`AdvanceMap` is now part of the replay-checked Lean reducer and the current
+supported preservation surface because interval changes and `min_size` logic
+are where the model starts to interact with more realistic peering control
+flow.
 
 No separate `Backfill` state should be introduced at this stage. The semantic
 core should keep a single `Recovering` state and model both partial catch-up
@@ -236,6 +254,19 @@ semantics.
 Immediately after that, add prefix-order properties for the explicit PG
 journal.
 
+That reduced invariant layer now exists as executable checks and propositions
+in [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean). The next proof work is to show preservation across the current small reducer subset rather than broadening the invariant statement first.
+
+The first preservation layer now covers:
+
+- `PeerInfoReceived`
+- `PeerQueryTimeout`
+- `AdvanceMap`
+
+and it is lifted through the handler, `reduceValidated`, and `step` boundaries.
+The next proof work is to extend that coverage to the remaining `lean-core`
+handlers before moving on to reachable-state reasoning.
+
 ## Replay Strategy
 
 Replay should compare semantic projections before comparing full snapshots.
@@ -249,6 +280,10 @@ The intended layering is:
 
 The earlier Idris exploration already illustrated why replay should not demand
 full structural equality over every bookkeeping field.
+
+The current Lean replay path is green on the checked-in `lean-core` subset,
+including randomized fuzz traces, so the next replay-related work is primarily
+supporting proof/debug ergonomics rather than repairing known alignment gaps.
 
 Disagreement handling should follow a soundness-first workflow:
 

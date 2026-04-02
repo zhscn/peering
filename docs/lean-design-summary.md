@@ -112,10 +112,12 @@ decisions:
 - `pendingActingChange`
 - `lastPeeringReset`
 
-`activated` can still be deferred until the Lean reducer reaches the
-`ActivateCommitted` bookkeeping path. But `authSources` now matters directly at
-the event/effect boundary because replica activation is source-aware in the C++
-reducer.
+That state now exists in executable form in
+[`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean).
+One implementation detail is now fixed intentionally: `peerInfo` is stored in a
+deterministic `TreeMap`, not a list, so authority-source tie-breaking matches
+the C++ reducer's ordered peer iteration instead of depending on message
+arrival order.
 
 ## First Reducer Slice
 
@@ -186,6 +188,7 @@ The repo now has a working Lean scaffold:
 - [`Peering/Types.lean`](/home/zhscn/code/peering-lean/Peering/Types.lean)
 - [`Peering/Image.lean`](/home/zhscn/code/peering-lean/Peering/Image.lean)
 - [`Peering/Machine.lean`](/home/zhscn/code/peering-lean/Peering/Machine.lean)
+- [`Peering/Invariants.lean`](/home/zhscn/code/peering-lean/Peering/Invariants.lean)
 - [`Peering/Replay.lean`](/home/zhscn/code/peering-lean/Peering/Replay.lean)
 - [`PeeringReplay.lean`](/home/zhscn/code/peering-lean/PeeringReplay.lean)
 
@@ -196,12 +199,21 @@ Current coverage:
 - the first image-algebra layer exists
 - source-aware recovery-gap and recovery-plan helpers now exist in `Image.lean`
 - an executable reducer skeleton now exists in `Machine.lean`
+- the reducer now uses a deterministic map-backed `peerInfo` representation
+  instead of list-order semantics
+- a first explicit invariant layer now exists in `Invariants.lean`
+- one-step preservation theorems now exist for `PeerInfoReceived`,
+  `PeerQueryTimeout`, and `AdvanceMap`
+- those preservation results are lifted through the handler,
+  `reduceValidated`, and `step` boundaries for the currently supported subset
 - a first structured JSONL replay parser/checker now exists in `Replay.lean`
 - the checked-in `peering-replay` executable validates JSONL traces directly
 - basic algebra lemmas are proved
 - the project builds with `lake build`
 - GitHub Actions now runs the C++ trace generator plus Lean replay under the
   `lean-core` event profile
+- current `lean-core` replay is green against the extracted C++ reducer,
+  including randomized fuzz runs over structured JSONL traces
 
 Project status:
 
@@ -211,21 +223,23 @@ Project status:
 
 Not implemented yet:
 
-- `Invariants.lean`
 - refinement statements
-- tighter replay normalization over the reduced semantic projection
-- independent semantic-check recomputation in Lean
+- one-step preservation proofs for the remaining `lean-core` handlers
+- stronger theorem support for reachable-state reasoning
 
 ## Immediate Next Step
 
 The next step should be:
 
-1. tighten `Replay.lean` around the reduced semantic projection
-2. reimplement the first independent semantic checks in Lean
-3. add `Invariants.lean`
+1. extend one-step preservation from the current proved subset to the rest of
+   the `lean-core` handlers
+2. keep that theorem surface aligned at the handler, `reduceValidated`, and
+   `step` boundaries
+3. start the first reachable-state / trace-level layer once the reduced event
+   subset is covered
 
-That should keep the replay workflow soundness-first while moving the proof
-layer onto explicit Lean propositions instead of only executable comparison.
+That keeps the replay workflow soundness-first while widening the proof surface
+from the first landed preservation results to the whole reduced reducer slice.
 
 The next proof-facing layer should preserve the current extracted C++ semantic
 surface:

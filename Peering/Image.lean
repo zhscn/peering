@@ -144,6 +144,19 @@ def authorityFromPeerInfo (info : PeerInfo) : AuthorityImage :=
   let normalized := normalizedPeerInfo info
   authorityFromImage normalized.osd normalized.image
 
+def rawAuthoritySources (infos : List PeerInfo) : AuthorityImage :=
+  { entries := infos.foldr (fun info acc => (authorityFromPeerInfo info).entries ++ acc) [] }
+
+def canonicalAuthorityImage (raw : AuthorityImage) : AuthorityImage :=
+  let entries :=
+    (AuthorityImage.support raw).filterMap fun obj =>
+      let authority := lookupAuthority raw obj
+      if authority.authorityLength = 0 then
+        none
+      else
+        some (obj, authority)
+  { entries := entries }
+
 def authorityImageValues (auth : AuthorityImage) : ObjectImage :=
   let entries :=
     (AuthorityImage.support auth).filterMap fun obj =>
@@ -155,16 +168,7 @@ def authorityImageValues (auth : AuthorityImage) : ObjectImage :=
   { entries := entries }
 
 def authoritativeSources (infos : List PeerInfo) : AuthorityImage :=
-  let raw : AuthorityImage :=
-    { entries := infos.foldr (fun info acc => (authorityFromPeerInfo info).entries ++ acc) [] }
-  let entries :=
-    (AuthorityImage.support raw).filterMap fun obj =>
-      let authority := lookupAuthority raw obj
-      if authority.authorityLength = 0 then
-        none
-      else
-        some (obj, authority)
-  { entries := entries }
+  canonicalAuthorityImage (rawAuthoritySources infos)
 
 def authoritativeImage (infos : List PeerInfo) : ObjectImage :=
   authorityImageValues (authoritativeSources infos)
@@ -233,5 +237,353 @@ theorem sameImage_implies_prefix (lhs rhs : ObjectImage) :
 
 theorem sameImage_refl (image : ObjectImage) : sameImage image image := by
   constructor <;> intro obj <;> exact Nat.le_refl _
+
+theorem lookupLengthEntries_ge_of_mem {entries : List (ObjectId × Length)}
+    {obj : ObjectId} {len : Length} :
+    (obj, len) ∈ entries → len ≤ lookupLengthEntries obj entries := by
+  induction entries with
+  | nil =>
+      intro h
+      cases h
+  | cons head tail ih =>
+      cases head with
+      | mk obj' len' =>
+          intro hMem
+          by_cases hEq : obj' = obj
+          · simp [lookupLengthEntries, hEq] at hMem ⊢
+            rcases hMem with rfl | hTail
+            · exact Nat.le_max_left _ _
+            · exact Nat.le_trans (ih hTail) (Nat.le_max_right _ _)
+          · simp [lookupLengthEntries, hEq] at hMem ⊢
+            rcases hMem with hHead | hTail
+            · exact False.elim (hEq hHead.1.symm)
+            · exact ih hTail
+
+theorem lookupAuthorityEntries_ge_of_mem
+    {entries : List (ObjectId × ObjectAuthority)}
+    {obj : ObjectId} {authority : ObjectAuthority} :
+    (obj, authority) ∈ entries →
+      authority.authorityLength ≤ (lookupAuthorityEntries obj entries).authorityLength := by
+  induction entries with
+  | nil =>
+      intro h
+      cases h
+  | cons head tail ih =>
+      cases head with
+      | mk obj' authority' =>
+          intro hMem
+          by_cases hEq : obj' = obj
+          · simp [lookupAuthorityEntries, hEq] at hMem ⊢
+            by_cases hLe :
+                (lookupAuthorityEntries obj tail).authorityLength ≤ authority'.authorityLength
+            · simp [hLe] at hMem ⊢
+              rcases hMem with rfl | hTail
+              · exact Nat.le_refl _
+              · exact Nat.le_trans (ih hTail) hLe
+            · simp [hLe] at hMem ⊢
+              have hAuthority' :
+                  authority'.authorityLength ≤ (lookupAuthorityEntries obj tail).authorityLength :=
+                Nat.le_of_not_ge hLe
+              rcases hMem with rfl | hTail
+              · exact hAuthority'
+              · exact ih hTail
+          · simp [lookupAuthorityEntries, hEq] at hMem ⊢
+            rcases hMem with hHead | hTail
+            · exact False.elim (hEq hHead.1.symm)
+            · exact ih hTail
+
+theorem mem_lookupAuthorityEntries_of_pos
+    {entries : List (ObjectId × ObjectAuthority)} {obj : ObjectId} :
+    0 < (lookupAuthorityEntries obj entries).authorityLength →
+      (obj, lookupAuthorityEntries obj entries) ∈ entries := by
+  induction entries with
+  | nil =>
+      intro h
+      simp [lookupAuthorityEntries] at h
+  | cons head tail ih =>
+      cases head with
+      | mk obj' authority =>
+          by_cases hEq : obj' = obj
+          · intro hPos
+            by_cases hLe :
+                (lookupAuthorityEntries obj tail).authorityLength ≤ authority.authorityLength
+            · simp [lookupAuthorityEntries, hEq, hLe]
+            · simp [lookupAuthorityEntries, hEq, hLe]
+              have hTailPos : 0 < (lookupAuthorityEntries obj tail).authorityLength := by
+                simpa [lookupAuthorityEntries, hEq, hLe] using hPos
+              exact Or.inr (ih hTailPos)
+          · intro hPos
+            simp [lookupAuthorityEntries, hEq]
+            have hTailPos : 0 < (lookupAuthorityEntries obj tail).authorityLength := by
+              simpa [lookupAuthorityEntries, hEq] using hPos
+            exact Or.inr (ih hTailPos)
+
+theorem mem_keys_of_lookupLengthEntries_pos
+    {entries : List (ObjectId × Length)} {obj : ObjectId} :
+    0 < lookupLengthEntries obj entries → obj ∈ entries.map Prod.fst := by
+  induction entries with
+  | nil =>
+      intro h
+      simp [lookupLengthEntries] at h
+  | cons head tail ih =>
+      cases head with
+      | mk obj' len =>
+          by_cases hEq : obj' = obj
+          · intro _
+            simp [hEq]
+          · intro hPos
+            have hTail : 0 < lookupLengthEntries obj tail := by
+              simpa [lookupLengthEntries, hEq] using hPos
+            simp [ih hTail]
+
+theorem mem_support_of_lookupLength_pos (image : ObjectImage) {obj : ObjectId} :
+    0 < lookupLength image obj → obj ∈ ObjectImage.support image := by
+  intro hPos
+  exact (List.mem_eraseDups).2 (mem_keys_of_lookupLengthEntries_pos hPos)
+
+theorem mem_keys_of_lookupAuthorityEntries_pos
+    {entries : List (ObjectId × ObjectAuthority)} {obj : ObjectId} :
+    0 < (lookupAuthorityEntries obj entries).authorityLength →
+      obj ∈ entries.map Prod.fst := by
+  induction entries with
+  | nil =>
+      intro h
+      simp [lookupAuthorityEntries] at h
+  | cons head tail ih =>
+      cases head with
+      | mk obj' authority =>
+          by_cases hEq : obj' = obj
+          · intro _
+            simp [hEq]
+          · intro hPos
+            have hTail :
+                0 < (lookupAuthorityEntries obj tail).authorityLength := by
+              simpa [lookupAuthorityEntries, hEq] using hPos
+            simp [ih hTail]
+
+theorem mem_support_of_lookupAuthority_pos (auth : AuthorityImage) {obj : ObjectId} :
+    0 < (lookupAuthority auth obj).authorityLength → obj ∈ AuthorityImage.support auth := by
+  intro hPos
+  exact (List.mem_eraseDups).2 (mem_keys_of_lookupAuthorityEntries_pos hPos)
+
+theorem mem_authorityFromImage_entries_of_lookupLength_pos
+    (source : OsdId) (image : ObjectImage) {obj : ObjectId} :
+    0 < lookupLength image obj →
+      (obj, { authorityOsd := source, authorityLength := lookupLength image obj }) ∈
+        (authorityFromImage source image).entries := by
+  intro hPos
+  unfold authorityFromImage
+  apply (List.mem_filterMap).2
+  refine ⟨obj, ?_, ?_⟩
+  · exact mem_support_of_lookupLength_pos image hPos
+  · simp [Nat.ne_of_gt hPos]
+
+theorem mem_authorityImageValues_entries_of_lookupAuthority_pos
+    (auth : AuthorityImage) {obj : ObjectId} :
+    0 < (lookupAuthority auth obj).authorityLength →
+      (obj, (lookupAuthority auth obj).authorityLength) ∈ (authorityImageValues auth).entries := by
+  intro hPos
+  unfold authorityImageValues
+  apply (List.mem_filterMap).2
+  refine ⟨obj, ?_, ?_⟩
+  · exact mem_support_of_lookupAuthority_pos auth hPos
+  · simp [Nat.ne_of_gt hPos]
+
+theorem lookupLength_authorityImageValues_ge_lookupAuthority
+    (auth : AuthorityImage) (obj : ObjectId) :
+    (lookupAuthority auth obj).authorityLength ≤ lookupLength (authorityImageValues auth) obj := by
+  by_cases hPos : 0 < (lookupAuthority auth obj).authorityLength
+  · exact lookupLengthEntries_ge_of_mem
+      (mem_authorityImageValues_entries_of_lookupAuthority_pos auth hPos)
+  · have hZero : (lookupAuthority auth obj).authorityLength = 0 := Nat.eq_zero_of_not_pos hPos
+    simp [hZero]
+
+theorem foldlMaxCommittedSeq_mono
+    (infos : List PeerInfo) {lhs rhs : JournalSeq} :
+    lhs ≤ rhs →
+      infos.foldl (fun best info => max best info.committedSeq) lhs ≤
+        infos.foldl (fun best info => max best info.committedSeq) rhs := by
+  intro h
+  induction infos generalizing lhs rhs with
+  | nil =>
+      simpa using h
+  | cons head tail ih =>
+      apply ih
+      exact (Nat.max_le).mpr
+        ⟨Nat.le_trans h (Nat.le_max_left _ _), Nat.le_max_right _ _⟩
+
+theorem le_foldlMaxCommittedSeq
+    (infos : List PeerInfo) (init : JournalSeq) :
+    init ≤ infos.foldl (fun best info => max best info.committedSeq) init := by
+  induction infos generalizing init with
+  | nil =>
+      simp
+  | cons head tail ih =>
+      exact Nat.le_trans (Nat.le_max_left _ _) (ih _)
+
+theorem committedSeq_le_authoritativeCommittedSeq_of_mem
+    (infos : List PeerInfo) (info : PeerInfo) :
+    info ∈ infos → info.committedSeq ≤ authoritativeCommittedSeq infos := by
+  intro hMem
+  unfold authoritativeCommittedSeq
+  induction infos with
+  | nil =>
+      cases hMem
+  | cons head tail ih =>
+      simp at hMem ⊢
+      cases hMem with
+      | inl hEq =>
+          have hSeq : head.committedSeq = info.committedSeq := by
+            cases hEq
+            rfl
+          simpa [authoritativeCommittedSeq] using
+            (hSeq ▸ le_foldlMaxCommittedSeq tail info.committedSeq)
+      | inr hTail =>
+          exact Nat.le_trans (ih hTail)
+            (by
+              simpa [authoritativeCommittedSeq] using
+                foldlMaxCommittedSeq_mono tail (lhs := 0) (rhs := head.committedSeq)
+                  (Nat.zero_le _))
+
+theorem effectivePeerImage_normalizedPeerInfo (info : PeerInfo) :
+    effectivePeerImage (normalizedPeerInfo info) = effectivePeerImage info := by
+  let image := effectivePeerImage info
+  change effectivePeerImage { info with image := image, committedLength := primaryLength image } = image
+  by_cases h : image.entries = []
+  · have hlen : primaryLength image = 0 := by
+      simp [primaryLength, lookupLength, lookupLengthEntries, h, image]
+    simp [effectivePeerImage, h, hlen]
+  · simp [effectivePeerImage, h]
+
+theorem effectivePGImage_normalizedPGInfo (info : PGInfo) :
+    effectivePGImage (normalizedPGInfo info) = effectivePGImage info := by
+  let image := effectivePGImage info
+  change effectivePGImage { info with image := image, committedLength := primaryLength image } = image
+  by_cases h : image.entries = []
+  · have hlen : primaryLength image = 0 := by
+      simp [primaryLength, lookupLength, lookupLengthEntries, h, image]
+    simp [effectivePGImage, h, hlen]
+  · simp [effectivePGImage, h]
+
+theorem mem_rawAuthoritySources_entries_of_mem
+    (infos : List PeerInfo) (info : PeerInfo)
+    (entry : ObjectId × ObjectAuthority) :
+    info ∈ infos →
+      entry ∈ (authorityFromPeerInfo info).entries →
+      entry ∈ (rawAuthoritySources infos).entries := by
+  intro hMem hEntry
+  induction infos generalizing info entry with
+  | nil =>
+      cases hMem
+  | cons head tail ih =>
+      have hMem' : info = head ∨ info ∈ tail := by
+        simpa using hMem
+      rcases hMem' with rfl | hTail
+      ·
+        simpa [rawAuthoritySources] using
+          (List.mem_append.mpr (Or.inl hEntry) :
+            entry ∈ (authorityFromPeerInfo info).entries ++ (rawAuthoritySources tail).entries)
+      ·
+        simpa [rawAuthoritySources] using
+          (List.mem_append.mpr (Or.inr (ih info entry hTail hEntry)) :
+            entry ∈ (authorityFromPeerInfo head).entries ++ (rawAuthoritySources tail).entries)
+
+theorem mem_canonicalAuthorityImage_entries_of_lookupAuthority_pos
+    (raw : AuthorityImage) {obj : ObjectId} :
+    0 < (lookupAuthority raw obj).authorityLength →
+      (obj, lookupAuthority raw obj) ∈ (canonicalAuthorityImage raw).entries := by
+  intro hPos
+  unfold canonicalAuthorityImage
+  apply (List.mem_filterMap).2
+  refine ⟨obj, ?_, ?_⟩
+  · exact mem_support_of_lookupAuthority_pos raw hPos
+  · simp [Nat.ne_of_gt hPos]
+
+theorem lookupAuthority_canonicalAuthorityImage_ge_lookupAuthority
+    (raw : AuthorityImage) (obj : ObjectId) :
+    (lookupAuthority raw obj).authorityLength ≤
+      (lookupAuthority (canonicalAuthorityImage raw) obj).authorityLength := by
+  by_cases hPos : 0 < (lookupAuthority raw obj).authorityLength
+  · exact lookupAuthorityEntries_ge_of_mem
+      (mem_canonicalAuthorityImage_entries_of_lookupAuthority_pos raw hPos)
+  · have hZero : (lookupAuthority raw obj).authorityLength = 0 := Nat.eq_zero_of_not_pos hPos
+    simp [canonicalAuthorityImage, hZero]
+
+theorem mem_rawAuthoritySources_entries_exists_peer
+    (infos : List PeerInfo) (entry : ObjectId × ObjectAuthority) :
+    entry ∈ (rawAuthoritySources infos).entries →
+      ∃ info ∈ infos, entry ∈ (authorityFromPeerInfo info).entries := by
+  intro hMem
+  induction infos with
+  | nil =>
+      simp [rawAuthoritySources] at hMem
+  | cons head tail ih =>
+      change entry ∈ (authorityFromPeerInfo head).entries ++ (rawAuthoritySources tail).entries at hMem
+      rcases List.mem_append.mp hMem with hHead | hTail
+      · exact ⟨head, by simp, hHead⟩
+      · rcases ih hTail with ⟨info, hInfo, hEntry⟩
+        exact ⟨info, by simp [hInfo], hEntry⟩
+
+theorem authorityLength_eq_lookupLength_of_mem_authorityFromImage
+    (source : OsdId) (image : ObjectImage) {obj : ObjectId} {authority : ObjectAuthority} :
+    (obj, authority) ∈ (authorityFromImage source image).entries →
+      authority.authorityLength = lookupLength image obj := by
+  intro hMem
+  unfold authorityFromImage at hMem
+  rcases (List.mem_filterMap).1 hMem with ⟨obj', hObj', hSome⟩
+  by_cases hZero : lookupLength image obj' = 0
+  · simp [hZero] at hSome
+  · simp [hZero] at hSome
+    rcases hSome with ⟨hEqObj, hEqAuth⟩
+    cases hEqObj
+    cases hEqAuth
+    rfl
+
+theorem authorityLength_eq_lookupLength_of_mem_authorityFromPeerInfo
+    (info : PeerInfo) {obj : ObjectId} {authority : ObjectAuthority} :
+    (obj, authority) ∈ (authorityFromPeerInfo info).entries →
+      authority.authorityLength = lookupLength (effectivePeerImage info) obj := by
+  intro hMem
+  simpa [authorityFromPeerInfo, effectivePeerImage_normalizedPeerInfo] using
+    authorityLength_eq_lookupLength_of_mem_authorityFromImage
+      (normalizedPeerInfo info).osd (normalizedPeerInfo info).image hMem
+
+theorem lookupAuthority_rawAuthoritySources_ge_peerLength
+    (infos : List PeerInfo) (info : PeerInfo) (obj : ObjectId)
+    (hMem : info ∈ infos) :
+    lookupLength (effectivePeerImage info) obj ≤
+      (lookupAuthority (rawAuthoritySources infos) obj).authorityLength := by
+  by_cases hPos : 0 < lookupLength (effectivePeerImage info) obj
+  · have hEntry :
+        (obj,
+          { authorityOsd := info.osd
+            authorityLength := lookupLength (effectivePeerImage info) obj }) ∈
+          (authorityFromPeerInfo info).entries := by
+      simpa [authorityFromPeerInfo, effectivePeerImage_normalizedPeerInfo] using
+        mem_authorityFromImage_entries_of_lookupLength_pos
+          info.osd (effectivePeerImage info) hPos
+    have hRaw :
+        (obj,
+          { authorityOsd := info.osd
+            authorityLength := lookupLength (effectivePeerImage info) obj }) ∈
+          (rawAuthoritySources infos).entries :=
+      mem_rawAuthoritySources_entries_of_mem infos info _ hMem hEntry
+    exact lookupAuthorityEntries_ge_of_mem hRaw
+  · have hZero : lookupLength (effectivePeerImage info) obj = 0 := Nat.eq_zero_of_not_pos hPos
+    simp [hZero]
+
+theorem prefixImage_authoritativeImage_of_mem
+    (infos : List PeerInfo) (info : PeerInfo)
+    (hMem : info ∈ infos) :
+    prefixImage (effectivePeerImage info) (authoritativeImage infos) := by
+  intro obj
+  unfold authoritativeImage authoritativeSources
+  exact Nat.le_trans
+    (lookupAuthority_rawAuthoritySources_ge_peerLength infos info obj hMem)
+    (Nat.le_trans
+      (lookupAuthority_canonicalAuthorityImage_ge_lookupAuthority
+        (rawAuthoritySources infos) obj)
+      (lookupLength_authorityImageValues_ge_lookupAuthority
+        (canonicalAuthorityImage (rawAuthoritySources infos)) obj))
 
 end Peering

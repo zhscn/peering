@@ -140,6 +140,11 @@ The intended toolchain is:
 The preferred trace format is structured JSONL. Legacy text output can remain
 available only as a compatibility path for older exploratory tooling.
 
+The current Lean replay path already handles the checked-in `lean-core`
+boundary and is kept green with CI plus randomized fuzzing. So replay work is
+now mostly about localizing proof/design issues quickly, not about repairing a
+known unstable bridge.
+
 The replay output should make it easy to inspect:
 
 - before snapshot

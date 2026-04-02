@@ -68,7 +68,7 @@ def normalizeObjRecovery (item : ObjRecovery) : ObjRecovery :=
   item
 
 def normalizePeerRecoveryPlan (plan : PeerRecoveryPlan) : PeerRecoveryPlan :=
-  { plan with recoveries := normalizeByRepr (plan.recoveries.map normalizeObjRecovery) }
+  { plan with recoveries := plan.recoveries.map normalizeObjRecovery }
 
 def normalizePeerInfo (info : PeerInfo) : PeerInfo :=
   { info with image := normalizeObjectImage info.image }
@@ -90,8 +90,8 @@ def normalizeSnapshot (snap : Snapshot) : Snapshot :=
     peersQueried := normalizeByRepr snap.peersQueried
     peersResponded := normalizeByRepr snap.peersResponded
     priorOsds := normalizeByRepr snap.priorOsds
-    peerRecoveryPlans := normalizeByRepr (snap.peerRecoveryPlans.map normalizePeerRecoveryPlan)
-    localRecoveryPlan := normalizeByRepr (snap.localRecoveryPlan.map normalizeObjRecovery)
+    peerRecoveryPlans := snap.peerRecoveryPlans.map normalizePeerRecoveryPlan
+    localRecoveryPlan := snap.localRecoveryPlan.map normalizeObjRecovery
     recovered := normalizeByRepr snap.recovered
     timedOutProbes := normalizeByRepr snap.timedOutProbes }
 
