@@ -38,8 +38,9 @@ jobs:
         run: |
           python3 scripts/replay_fuzz.py \
             --profile lean-core \
-            --cycles 128 \
-            --event-range 32 512 \
+            --cycles 256 \
+            --event-range 32 1024 \
+            --jobs 4 \
             --stop-on-first-failure \
             --save-failure-traces artifacts/lean-core-fuzz \
             --require-cpp-image-invariant
@@ -48,8 +49,9 @@ jobs:
         run: |
           python3 scripts/replay_fuzz.py \
             --profile full \
-            --cycles 8 \
-            --event-range 32 512 \
+            --cycles 24 \
+            --event-range 32 1024 \
+            --jobs 4 \
             --stop-on-first-failure \
             --save-failure-traces artifacts/full-fuzz
 

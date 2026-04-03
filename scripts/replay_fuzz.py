@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import random
@@ -86,7 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stop-on-first-failure",
         action="store_true",
-        help="Stop immediately after the first failing cycle.",
+        help=(
+            "Stop after the first observed failing cycle. "
+            "With --jobs > 1, already-running cycles may still finish."
+        ),
     )
     parser.add_argument(
         "--save-failure-traces",
@@ -98,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild",
         action="store_true",
         help="Rebuild cross_validate and peering-replay before fuzzing.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of cycles to execute in parallel. "
+            "Use 1 to keep serial execution."
+        ),
     )
     parser.add_argument(
         "--require-cpp-image-invariant",
@@ -304,6 +317,137 @@ def choose_cycle_size(
     return rng.randint(minimum, maximum)
 
 
+def build_run_configs(args: argparse.Namespace, rng: random.Random) -> list[RunConfig]:
+    configs: list[RunConfig] = []
+    seen_configs: set[tuple[int, int]] = set()
+    for cycle in range(1, args.cycles + 1):
+        event = choose_cycle_size(
+            rng,
+            fixed=args.event,
+            bounds=tuple(args.event_range) if args.event_range is not None else None,
+            label="event",
+        )
+        if args.seed is not None:
+            seed = args.seed
+        else:
+            while True:
+                seed = rng.randrange(0, 2**63)
+                dedup_key = (seed, event)
+                if dedup_key not in seen_configs:
+                    seen_configs.add(dedup_key)
+                    break
+        configs.append(
+            RunConfig(
+                cycle=cycle,
+                profile=args.profile,
+                seed=seed,
+                event=event,
+            )
+        )
+    return configs
+
+
+def run_configs_serial(
+    configs: Sequence[RunConfig],
+    *,
+    cycles: int,
+    cross_validate: Path,
+    replayer: Path,
+    failure_dir: Path | None,
+    require_cpp_image_invariant: bool,
+    stop_on_first_failure: bool,
+) -> list[FailureRecord]:
+    failures: list[FailureRecord] = []
+    for config in configs:
+        print(
+            f"[{config.cycle}/{cycles}] "
+            f"seed={config.seed} event={config.event} profile={config.profile}",
+            flush=True,
+        )
+        ok, failure = run_cycle(
+            config=config,
+            cross_validate=cross_validate,
+            replayer=replayer,
+            failure_dir=failure_dir,
+            require_cpp_image_invariant=require_cpp_image_invariant,
+        )
+        if ok:
+            print("  ok", flush=True)
+            continue
+
+        print("  failure", flush=True)
+        assert failure is not None
+        failures.append(failure)
+        if stop_on_first_failure:
+            break
+    return failures
+
+
+def run_configs_parallel(
+    configs: Sequence[RunConfig],
+    *,
+    cycles: int,
+    jobs: int,
+    cross_validate: Path,
+    replayer: Path,
+    failure_dir: Path | None,
+    require_cpp_image_invariant: bool,
+    stop_on_first_failure: bool,
+) -> list[FailureRecord]:
+    failures: list[FailureRecord] = []
+    stop_submitting = False
+    next_index = 0
+    pending: dict[concurrent.futures.Future[tuple[bool, FailureRecord | None]], RunConfig] = {}
+
+    def submit_next(
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> bool:
+        nonlocal next_index
+        if stop_submitting or next_index >= len(configs):
+            return False
+        config = configs[next_index]
+        next_index += 1
+        print(
+            f"[{config.cycle}/{cycles}] "
+            f"seed={config.seed} event={config.event} profile={config.profile}",
+            flush=True,
+        )
+        future = executor.submit(
+            run_cycle,
+            config,
+            cross_validate,
+            replayer,
+            failure_dir,
+            require_cpp_image_invariant,
+        )
+        pending[future] = config
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+        while len(pending) < jobs and submit_next(executor):
+            pass
+
+        while pending:
+            done, _ = concurrent.futures.wait(
+                pending,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                config = pending.pop(future)
+                ok, failure = future.result()
+                if ok:
+                    print(f"  ok [{config.cycle}/{cycles}]", flush=True)
+                else:
+                    print(f"  failure [{config.cycle}/{cycles}]", flush=True)
+                    assert failure is not None
+                    failures.append(failure)
+                    if stop_on_first_failure:
+                        stop_submitting = True
+                while len(pending) < jobs and submit_next(executor):
+                    pass
+    return failures
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -321,6 +465,8 @@ def main() -> int:
             raise ValueError("--cycles must be positive")
         if args.event <= 0:
             raise ValueError("--event must be positive")
+        if args.jobs <= 0:
+            raise ValueError("--jobs must be positive")
         if args.rebuild:
             rebuild_targets(repo_root)
         ensure_executable(cross_validate, "cross_validate")
@@ -330,60 +476,36 @@ def main() -> int:
         return 2
 
     rng: random.Random = random.SystemRandom()
-    failures: list[FailureRecord] = []
-    seen_configs: set[tuple[int, int]] = set()
+    try:
+        configs = build_run_configs(args, rng)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    for cycle in range(1, args.cycles + 1):
-        try:
-            event = choose_cycle_size(
-                rng,
-                fixed=args.event,
-                bounds=tuple(args.event_range)
-                if args.event_range is not None
-                else None,
-                label="event",
-            )
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        if args.seed is not None:
-            seed = args.seed
-        else:
-            while True:
-                seed = rng.randrange(0, 2**63)
-                dedup_key = (seed, event)
-                if dedup_key not in seen_configs:
-                    seen_configs.add(dedup_key)
-                    break
-        config = RunConfig(
-            cycle=cycle,
-            profile=args.profile,
-            seed=seed,
-            event=event,
-        )
-        print(
-            f"[{cycle}/{args.cycles}] "
-            f"seed={config.seed} event={config.event} profile={config.profile}",
-            flush=True,
-        )
-        ok, failure = run_cycle(
-            config=config,
+    if args.jobs == 1:
+        failures = run_configs_serial(
+            configs,
+            cycles=args.cycles,
             cross_validate=cross_validate,
             replayer=replayer,
             failure_dir=args.save_failure_traces,
             require_cpp_image_invariant=args.require_cpp_image_invariant,
+            stop_on_first_failure=args.stop_on_first_failure,
         )
-        if ok:
-            print("  ok", flush=True)
-            continue
-
-        print("  failure", flush=True)
-        assert failure is not None
-        failures.append(failure)
-        if args.stop_on_first_failure:
-            break
+    else:
+        failures = run_configs_parallel(
+            configs,
+            cycles=args.cycles,
+            jobs=args.jobs,
+            cross_validate=cross_validate,
+            replayer=replayer,
+            failure_dir=args.save_failure_traces,
+            require_cpp_image_invariant=args.require_cpp_image_invariant,
+            stop_on_first_failure=args.stop_on_first_failure,
+        )
 
     if failures:
+        failures.sort(key=lambda failure: failure.config.cycle)
         report_failures(failures)
         if args.save_failure_traces is not None:
             save_failure_summary(failures, args.save_failure_traces)
