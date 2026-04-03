@@ -1225,11 +1225,30 @@ struct EventGenerator {
     osd_id_t from = snap.acting.primary();
     if (from < 0)
       from = random_peer();
-    uint64_t len = std::uniform_int_distribution<uint64_t>(50, 300)(rng);
     epoch_t ep = snap.epoch;
     if (std::uniform_int_distribution<int>(0, 4)(rng) == 0) {
       ep = snap.epoch > 1 ? snap.epoch - 1 : 1;
     }
+    if (profile == EventProfile::LeanCore) {
+      auto auth_image = snap.auth_image;
+      auto auth_sources = snap.auth_sources;
+      return event::ReplicaActivate{
+          .from = from,
+          .auth_info =
+              PeerInfo{
+                  .osd = from,
+                  .committed_seq = snap.auth_seq,
+                  .committed_length = primary_length(auth_image),
+                  .image = auth_image,
+                  .last_epoch_started = ep,
+                  .last_interval_started = ep,
+              },
+          .auth_sources = auth_sources,
+          .authoritative_seq = snap.auth_seq,
+          .activation_epoch = ep,
+      };
+    }
+    uint64_t len = std::uniform_int_distribution<uint64_t>(50, 300)(rng);
     return event::ReplicaActivate{
         .from = from,
         .auth_info =
