@@ -103,8 +103,9 @@ decisions:
 - queried/responded peers
 - prior-interval probe set
 - timed-out probes
-- authoritative image
+- authoritative readable image
 - authoritative source map
+- authoritative blob finalization metadata
 - peer recovery plans
 - local recovery plan
 - recovered peers
@@ -118,6 +119,9 @@ One implementation detail is now fixed intentionally: `peerInfo` is stored in a
 deterministic `TreeMap`, not a list, so authority-source tie-breaking matches
 the C++ reducer's ordered peer iteration instead of depending on message
 arrival order.
+`authImage` is interpreted as the committed readable prefix, while
+seal/finalization is carried separately as blob metadata rather than as a
+publication gate.
 
 ## First Reducer Slice
 

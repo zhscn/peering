@@ -55,11 +55,18 @@ struct AuthImageEntry {
   uint64_t len{};
 };
 
+struct BlobMetaEntry {
+  uint64_t obj{};
+  bool sealed{};
+  std::optional<uint64_t> final_len;
+};
+
 struct PeerInfoView {
   int32_t osd{};
   uint64_t committed_seq{};
   uint64_t committed_length{};
   std::vector<ObjImageEntry> image;
+  std::vector<BlobMetaEntry> blob_meta;
   uint32_t last_epoch_started{};
   uint32_t last_interval_started{};
 };
@@ -69,6 +76,7 @@ struct PGInfoView {
   uint64_t committed_seq{};
   uint64_t committed_length{};
   std::vector<ObjImageEntry> image;
+  std::vector<BlobMetaEntry> blob_meta;
   uint32_t last_epoch_started{};
   uint32_t last_interval_started{};
   uint32_t last_epoch_clean{};
@@ -112,6 +120,7 @@ struct SnapshotView {
   uint64_t auth_seq{};
   std::vector<ObjImageEntry> auth_image;
   std::vector<AuthImageEntry> auth_sources;
+  std::vector<BlobMetaEntry> auth_blob_meta;
   std::vector<PeerInfoView> peer_info;
   std::vector<int32_t> peers_queried;
   std::vector<int32_t> peers_responded;
@@ -153,6 +162,7 @@ struct ReplicaActivateView {
   int32_t from{};
   PeerInfoView auth_info;
   std::vector<AuthImageEntry> auth_sources;
+  std::vector<BlobMetaEntry> auth_blob_meta;
   uint64_t authoritative_seq{};
   uint32_t activation_epoch{};
 };
@@ -180,6 +190,7 @@ struct SendActivateView {
   uint64_t pgid{};
   PeerInfoView auth_info;
   std::vector<AuthImageEntry> auth_sources;
+  std::vector<BlobMetaEntry> auth_blob_meta;
   uint64_t authoritative_seq{};
   uint32_t activation_epoch{};
 };
@@ -190,6 +201,7 @@ struct ActivatePGView {
   uint64_t authoritative_seq{};
   uint64_t authoritative_length{};
   std::vector<ObjImageEntry> authoritative_image;
+  std::vector<BlobMetaEntry> authoritative_blob_meta;
   uint32_t activation_epoch{};
 };
 
@@ -223,6 +235,7 @@ struct PublishStatsView {
   uint64_t committed_length{};
   std::vector<ObjImageEntry> image;
   std::vector<ObjImageEntry> authoritative_image;
+  std::vector<BlobMetaEntry> authoritative_blob_meta;
   int acting_size{};
   int up_size{};
 };
@@ -363,6 +376,16 @@ static auto to_entries(const AuthorityImage &auth)
   return v;
 }
 
+static auto to_entries(const BlobMetaImage &blob_meta)
+    -> std::vector<BlobMetaEntry> {
+  std::vector<BlobMetaEntry> v;
+  v.reserve(blob_meta.size());
+  for (const auto &[obj, meta] : blob_meta) {
+    v.push_back({obj, meta.sealed, meta.final_len});
+  }
+  return v;
+}
+
 static auto to_vec(const std::set<osd_id_t> &s) -> std::vector<int32_t> {
   return {s.begin(), s.end()};
 }
@@ -400,6 +423,7 @@ static auto to_peer_info_view(const PeerInfo &raw) -> PeerInfoView {
           info.committed_seq,
           info.committed_length,
           to_entries(effective_image(info)),
+          to_entries(info.blob_meta),
           info.last_epoch_started,
           info.last_interval_started};
 }
@@ -410,6 +434,7 @@ static auto to_pg_info_view(const PGInfo &raw) -> PGInfoView {
           info.committed_seq,
           info.committed_length,
           to_entries(info.image),
+          to_entries(info.blob_meta),
           info.last_epoch_started,
           info.last_interval_started,
           info.last_epoch_clean,
@@ -456,6 +481,7 @@ static auto to_snapshot_view(const PeeringStateMachine::Snapshot &snap)
       .auth_seq = snap.auth_seq,
       .auth_image = to_entries(snap.auth_image),
       .auth_sources = to_entries(snap.auth_sources),
+      .auth_blob_meta = to_entries(snap.auth_blob_meta),
       .peer_info = to_peer_info_views(snap.peer_info),
       .peers_queried = to_vec(snap.peers_queried),
       .peers_responded = to_vec(snap.peers_responded),
@@ -551,6 +577,7 @@ static auto event_to_json(const PeeringEvent &ev) -> std::string {
                 .from = e.from,
                 .auth_info = to_peer_info_view(e.auth_info),
                 .auth_sources = to_entries(e.auth_sources),
+                .auth_blob_meta = to_entries(e.auth_blob_meta),
                 .authoritative_seq = e.authoritative_seq,
                 .activation_epoch = e.activation_epoch,
             });
@@ -601,6 +628,7 @@ static auto effect_to_json(const PeeringEffect &fx) -> std::string {
                 .pgid = f.pgid,
                 .auth_info = to_peer_info_view(f.auth_info),
                 .auth_sources = to_entries(f.auth_sources),
+                .auth_blob_meta = to_entries(f.auth_blob_meta),
                 .authoritative_seq = f.authoritative_seq,
                 .activation_epoch = f.activation_epoch,
             });
@@ -612,6 +640,8 @@ static auto effect_to_json(const PeeringEffect &fx) -> std::string {
                 .authoritative_seq = f.authoritative_seq,
                 .authoritative_length = f.authoritative_length,
                 .authoritative_image = to_entries(f.authoritative_image),
+                .authoritative_blob_meta =
+                    to_entries(f.authoritative_blob_meta),
                 .activation_epoch = f.activation_epoch,
             });
           },
@@ -680,6 +710,8 @@ static auto effect_to_json(const PeeringEffect &fx) -> std::string {
                 .committed_length = f.committed_length,
                 .image = to_entries(f.image),
                 .authoritative_image = to_entries(f.authoritative_image),
+                .authoritative_blob_meta =
+                    to_entries(f.authoritative_blob_meta),
                 .acting_size = f.acting_size,
                 .up_size = f.up_size,
             });
@@ -742,6 +774,7 @@ static auto known_peer_images(const PeeringStateMachine::Snapshot &snap)
       .committed_seq = local.committed_seq,
       .committed_length = local.committed_length,
       .image = local.image,
+      .blob_meta = local.blob_meta,
       .last_epoch_started = local.last_epoch_started,
       .last_interval_started = local.last_interval_started,
   });
@@ -784,6 +817,8 @@ snapshot_image_invariant(const PeeringStateMachine::Snapshot &snap) {
   auto known_peers = known_peer_images(snap);
   auto recomputed_sources = authoritative_sources(known_peers);
   auto recomputed_image = authority_image_values(recomputed_sources);
+  auto recomputed_blob_meta =
+      authoritative_blob_meta(known_peers, recomputed_sources);
   auto recomputed_seq = observed_auth_seq(known_peers);
   auto expected_peer_plans = build_peer_recovery_plans(
       recomputed_sources, recomputed_seq, acting_replica_images(snap));
@@ -802,6 +837,8 @@ snapshot_image_invariant(const PeeringStateMachine::Snapshot &snap) {
   if (snap.auth_seq != recomputed_seq)
     return false;
   if (!same_image(authority_image_values(snap.auth_sources), recomputed_image))
+    return false;
+  if (snap.auth_blob_meta != recomputed_blob_meta)
     return false;
   if (snap.local_info.committed_seq > snap.auth_seq)
     return false;
@@ -1232,6 +1269,7 @@ struct EventGenerator {
     if (profile == EventProfile::LeanCore) {
       auto auth_image = snap.auth_image;
       auto auth_sources = snap.auth_sources;
+      auto auth_blob_meta = snap.auth_blob_meta;
       return event::ReplicaActivate{
           .from = from,
           .auth_info =
@@ -1240,10 +1278,12 @@ struct EventGenerator {
                   .committed_seq = snap.auth_seq,
                   .committed_length = primary_length(auth_image),
                   .image = auth_image,
+                  .blob_meta = auth_blob_meta,
                   .last_epoch_started = ep,
                   .last_interval_started = ep,
               },
           .auth_sources = auth_sources,
+          .auth_blob_meta = auth_blob_meta,
           .authoritative_seq = snap.auth_seq,
           .activation_epoch = ep,
       };
@@ -1258,9 +1298,11 @@ struct EventGenerator {
                 .committed_length = len,
                 .image = snap.auth_image.empty() ? primary_image(len)
                                                  : snap.auth_image,
+                .blob_meta = snap.auth_blob_meta,
                 .last_epoch_started = ep,
             },
         .auth_sources = snap.auth_sources,
+        .auth_blob_meta = snap.auth_blob_meta,
         .authoritative_seq = snap.auth_seq > 0 ? snap.auth_seq : len,
         .activation_epoch = ep,
     };
@@ -1332,6 +1374,18 @@ static void print_prefixed_auth_source_lines(std::string_view label,
   for (const auto &[obj, item] : auth) {
     fmt::print("{} {} {} {}\n", label, obj, item.authority_osd,
                item.authority_length);
+  }
+}
+
+static void print_prefixed_blob_meta_lines(std::string_view label,
+                                           const BlobMetaImage &blob_meta) {
+  for (const auto &[obj, item] : blob_meta) {
+    fmt::print("{} {} {} ", label, obj, item.sealed ? 1 : 0);
+    if (item.final_len.has_value()) {
+      fmt::print("{}\n", *item.final_len);
+    } else {
+      fmt::print("-1\n");
+    }
   }
 }
 
@@ -1410,6 +1464,8 @@ static void print_event(const PeeringEvent &ev) {
                        e.auth_info.last_epoch_started);
             print_prefixed_auth_source_lines("activation_auth_source",
                                              e.auth_sources);
+            print_prefixed_blob_meta_lines("activation_blob_meta",
+                                           e.auth_blob_meta);
             fmt::print("activation_epoch {}\n", e.activation_epoch);
           },
           [](const event::ReplicaRecoveryComplete &e) {
@@ -1447,6 +1503,10 @@ static void print_auth_source_lines(const AuthorityImage &auth_sources) {
     fmt::print("auth_source {} {} {}\n", obj, item.authority_osd,
                item.authority_length);
   }
+}
+
+static void print_blob_meta_lines(const BlobMetaImage &blob_meta) {
+  print_prefixed_blob_meta_lines("auth_blob_meta", blob_meta);
 }
 
 static void
@@ -1501,6 +1561,7 @@ static void print_state(const PeeringStateMachine::Snapshot &snap) {
   print_object_image(snap.auth_image);
   fmt::print("\n");
   print_auth_source_lines(snap.auth_sources);
+  print_blob_meta_lines(snap.auth_blob_meta);
   print_peer_image_lines(snap.peer_info);
   fmt::print("peers_queried ");
   print_osd_set(snap.peers_queried);

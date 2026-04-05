@@ -18,6 +18,7 @@ structure Snapshot where
   authSeq : JournalSeq := 0
   authImage : ObjectImage := {}
   authSources : AuthorityImage := {}
+  authBlobMeta : BlobMetaImage := {}
   peerInfo : PeerInfoMap := {}
   peersQueried : List OsdId := []
   peersResponded : List OsdId := []
@@ -84,7 +85,8 @@ def normalizePeerInfoMap (entries : PeerInfoMap) : PeerInfoMap :=
     {}
 
 def upsertRecoveredPeerInfo (entries : PeerInfoMap)
-    (osd : OsdId) (authSeq : JournalSeq) (authImage : ObjectImage) :
+    (osd : OsdId) (authSeq : JournalSeq) (authImage : ObjectImage)
+    (authBlobMeta : BlobMetaImage) :
     PeerInfoMap :=
   let updated :=
     match lookupPeerInfo entries osd with
@@ -94,11 +96,13 @@ def upsertRecoveredPeerInfo (entries : PeerInfoMap)
           osd := osd
           committedSeq := authSeq
           committedLength := primaryLength authImage
+          blobMeta := authBlobMeta
           image := authImage }
     | none =>
         { osd := osd
           committedSeq := authSeq
           committedLength := primaryLength authImage
+          blobMeta := authBlobMeta
           image := authImage }
   insertPeerInfo entries osd updated
 
@@ -141,6 +145,7 @@ def knownPeerImages (snap : Snapshot) : List PeerInfo :=
     committedSeq := localInfo.committedSeq
     committedLength := localInfo.committedLength
     image := localInfo.image
+    blobMeta := localInfo.blobMeta
     lastEpochStarted := localInfo.lastEpochStarted
     lastIntervalStarted := localInfo.lastIntervalStarted
   }]
@@ -165,6 +170,7 @@ def refreshAuthorityFromKnownPeers (snap : Snapshot) : Snapshot :=
   { snap with
     authSeq := authoritativeCommittedSeq known
     authSources := authSources
+    authBlobMeta := authoritativeBlobMeta known authSources
     authImage := authorityImageValues authSources }
 
 def refreshRecoveryPlansFromCurrentAuthority (snap : Snapshot) : Snapshot :=
@@ -247,6 +253,7 @@ def effectPublishStats (snap : Snapshot) : PeeringEffect :=
     committedLength := primaryLength (effectivePGImage snap.localInfo)
     image := effectivePGImage snap.localInfo
     authoritativeImage := snap.authImage
+    authoritativeBlobMeta := snap.authBlobMeta
     actingSize := snap.acting.size
     upSize := snap.up.size
   }
@@ -274,6 +281,7 @@ def resetPeeringState (snap : Snapshot) : Snapshot :=
     authSeq := 0
     authImage := {}
     authSources := {}
+    authBlobMeta := {}
     peerRecoveryPlans := []
     localRecoveryPlan := []
     recovered := []
@@ -351,6 +359,7 @@ def tryActivateLocalInfo (snap : Snapshot) : PGInfo :=
     {
       updated with
         image := snap.authImage
+        blobMeta := snap.authBlobMeta
         committedSeq := snap.authSeq
         committedLength := primaryLength snap.authImage
     }
@@ -383,10 +392,12 @@ def tryActivate (snap : Snapshot) : Snapshot × List PeeringEffect :=
             committedSeq := snap.authSeq
             committedLength := primaryLength snap.authImage
             image := snap.authImage
+            blobMeta := snap.authBlobMeta
             lastEpochStarted := snap.epoch
             lastIntervalStarted := snap.epoch
           }
           authSources := snap.authSources
+          authBlobMeta := snap.authBlobMeta
           authoritativeSeq := snap.authSeq
           activationEpoch := snap.epoch
         }
@@ -398,6 +409,7 @@ def tryActivate (snap : Snapshot) : Snapshot × List PeeringEffect :=
           authoritativeSeq := snap.authSeq
           authoritativeLength := primaryLength snap.authImage
           authoritativeImage := snap.authImage
+          authoritativeBlobMeta := snap.authBlobMeta
           activationEpoch := snap.epoch
         },
         effectPersist snap,
@@ -519,6 +531,7 @@ def startPeeringPrimarySelfInfo (snap : Snapshot) (priorOsds : List OsdId) : Pee
     committedSeq := entered.localInfo.committedSeq
     committedLength := entered.localInfo.committedLength
     image := effectivePGImage entered.localInfo
+    blobMeta := entered.localInfo.blobMeta
     lastEpochStarted := entered.localInfo.lastEpochStarted
     lastIntervalStarted := entered.localInfo.lastIntervalStarted
   }
@@ -575,6 +588,9 @@ def onInitialize (snap : Snapshot) (e : Event.Initialize) :
 
 def peerInfoReceivedInfo (e : Event.PeerInfoReceived) : PeerInfo :=
   normalizedPeerInfo { e.info with osd := e.sender }
+
+def replicaActivatePeerInfo (e : Event.ReplicaActivate) : PeerInfo :=
+  normalizedPeerInfo { e.authInfo with osd := e.sender }
 
 def peerInfoReceivedRefreshedSnap (snap : Snapshot) (e : Event.PeerInfoReceived) : Snapshot :=
   refreshImageStateFromKnownPeers {
@@ -642,12 +658,13 @@ def onRecoveryComplete (snap : Snapshot) (e : Event.RecoveryComplete) :
   else
     let completed := osdSetInsert snap.recovered e.peer
     let peerInfo :=
-      upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
+      upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage snap.authBlobMeta
     let localInfo :=
       if e.peer = snap.whoami then
         {
           snap.localInfo with
             image := snap.authImage
+            blobMeta := snap.authBlobMeta
             committedSeq := snap.authSeq
             committedLength := primaryLength snap.authImage
         }
@@ -679,11 +696,12 @@ def onAllReplicasRecovered (snap : Snapshot) (e : Event.AllReplicasRecovered) :
       let peerInfo :=
         e.peers.foldl
           (fun entries peer =>
-            upsertRecoveredPeerInfo entries peer snap.authSeq snap.authImage)
+            upsertRecoveredPeerInfo entries peer snap.authSeq snap.authImage snap.authBlobMeta)
           snap.peerInfo
       let localInfo := {
         snap.localInfo with
           image := snap.authImage
+          blobMeta := snap.authBlobMeta
           committedSeq := snap.authSeq
           committedLength := primaryLength snap.authImage
       }
@@ -709,10 +727,11 @@ def onReplicaActivate (snap : Snapshot) (e : Event.ReplicaActivate) :
   else if e.activationEpoch ≠ snap.epoch || e.sender ≠ snap.acting.primary.getD (-1) then
     (snap, [])
   else
-    let authInfo := normalizedPeerInfo e.authInfo
+    let authInfo := replicaActivatePeerInfo e
     let authSeq := if e.authoritativeSeq > 0 then e.authoritativeSeq else authInfo.committedSeq
     let authSources :=
       if authorityImageEmpty e.authSources then authorityFromPeerInfo authInfo else e.authSources
+    let authBlobMeta := e.authBlobMeta
     let authImage :=
       if authorityImageEmpty authSources then authInfo.image else authorityImageValues authSources
     let advanceHistory :=
@@ -724,6 +743,7 @@ def onReplicaActivate (snap : Snapshot) (e : Event.ReplicaActivate) :
     let localInfo := {
       snap.localInfo with
         image := localImage
+        blobMeta := authBlobMeta
         committedSeq := localCommittedSeq
         committedLength := primaryLength localImage
         lastEpochStarted :=
@@ -731,13 +751,14 @@ def onReplicaActivate (snap : Snapshot) (e : Event.ReplicaActivate) :
         lastIntervalStarted :=
           if advanceHistory then e.activationEpoch else snap.localInfo.lastIntervalStarted
     }
-    let snap := refreshRecoveryPlansFromCurrentAuthority {
-      snap with
-        authSeq := authSeq
-        authSources := authSources
-        authImage := authImage
-        localInfo := localInfo
-    }
+    let snap :=
+      { refreshAuthorityFromKnownPeers {
+          snap with
+            peerInfo := insertPeerInfo snap.peerInfo e.sender authInfo
+            localInfo := localInfo
+        } with
+          authBlobMeta := authBlobMeta }
+    let snap := refreshRecoveryPlansFromCurrentAuthority snap
     let (snap, fx) := transitionTo snap .replicaActive "activated by primary"
     (snap, fx ++ [effectPersist snap, effectPublishStats snap])
 
@@ -773,6 +794,7 @@ def onReplicaRecoveryComplete (snap : Snapshot)
           localInfo := {
             snap.localInfo with
               image := clamped
+              blobMeta := snap.authBlobMeta
               committedSeq := recoveredSeq
               committedLength := primaryLength clamped
               lastEpochStarted := e.activationEpoch

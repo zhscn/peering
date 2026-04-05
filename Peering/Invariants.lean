@@ -654,6 +654,7 @@ def localKnownPeer (whoami : OsdId) (localInfo : PGInfo) : PeerInfo :=
     committedSeq := (normalizedPGInfo localInfo).committedSeq
     committedLength := (normalizedPGInfo localInfo).committedLength
     image := (normalizedPGInfo localInfo).image
+    blobMeta := (normalizedPGInfo localInfo).blobMeta
     lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
     lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted
   }
@@ -667,6 +668,7 @@ theorem effectivePeerImage_localKnownPeer
         committedSeq := (normalizedPGInfo localInfo).committedSeq
         committedLength := primaryLength image
         image := image
+        blobMeta := (normalizedPGInfo localInfo).blobMeta
         lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
         lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted } = image
   by_cases h : image.entries = []
@@ -686,6 +688,7 @@ theorem authorityFromPeerInfo_localKnownPeer
           committedSeq := (normalizedPGInfo localInfo).committedSeq
           committedLength := (normalizedPGInfo localInfo).committedLength
           image := (normalizedPGInfo localInfo).image
+          blobMeta := (normalizedPGInfo localInfo).blobMeta
           lastEpochStarted := (normalizedPGInfo localInfo).lastEpochStarted
           lastIntervalStarted := (normalizedPGInfo localInfo).lastIntervalStarted } =
         effectivePGImage localInfo := by
@@ -771,6 +774,7 @@ theorem localCommittedSeq_le_authSeq_refreshAuthorityFromKnownPeers
       committedSeq := (normalizedPGInfo snap.localInfo).committedSeq
       committedLength := (normalizedPGInfo snap.localInfo).committedLength
       image := (normalizedPGInfo snap.localInfo).image
+      blobMeta := (normalizedPGInfo snap.localInfo).blobMeta
       lastEpochStarted := (normalizedPGInfo snap.localInfo).lastEpochStarted
       lastIntervalStarted := (normalizedPGInfo snap.localInfo).lastIntervalStarted
     }
@@ -786,6 +790,7 @@ theorem localImage_prefix_authImage_refreshAuthorityFromKnownPeers
       committedSeq := (normalizedPGInfo snap.localInfo).committedSeq
       committedLength := (normalizedPGInfo snap.localInfo).committedLength
       image := (normalizedPGInfo snap.localInfo).image
+      blobMeta := (normalizedPGInfo snap.localInfo).blobMeta
       lastEpochStarted := (normalizedPGInfo snap.localInfo).lastEpochStarted
       lastIntervalStarted := (normalizedPGInfo snap.localInfo).lastIntervalStarted
     }
@@ -796,6 +801,7 @@ theorem localImage_prefix_authImage_refreshAuthorityFromKnownPeers
           committedSeq := (normalizedPGInfo snap.localInfo).committedSeq
           committedLength := primaryLength image
           image := image
+          blobMeta := (normalizedPGInfo snap.localInfo).blobMeta
           lastEpochStarted := (normalizedPGInfo snap.localInfo).lastEpochStarted
           lastIntervalStarted := (normalizedPGInfo snap.localInfo).lastIntervalStarted } = image
     by_cases h : image.entries = []
@@ -1327,6 +1333,7 @@ theorem localWithinAuthority_tryActivateLocalInfo
               committedSeq := snap.authSeq
               committedLength := primaryLength snap.authImage
               image := snap.authImage
+              blobMeta := snap.authBlobMeta
               lastEpochStarted := snap.epoch
               lastIntervalStarted := snap.epoch
               lastEpochClean := snap.localInfo.lastEpochClean
@@ -2362,6 +2369,7 @@ def recoveryCompleteLocalInfo (snap : Snapshot) (e : Event.RecoveryComplete) : P
     {
       snap.localInfo with
         image := snap.authImage
+        blobMeta := snap.authBlobMeta
         committedSeq := snap.authSeq
         committedLength := primaryLength snap.authImage
     }
@@ -2371,7 +2379,13 @@ def recoveryCompleteLocalInfo (snap : Snapshot) (e : Event.RecoveryComplete) : P
 def recoveryCompleteRefreshedSnap (snap : Snapshot) (e : Event.RecoveryComplete) : Snapshot :=
   refreshImageStateFromKnownPeers {
     snap with
-      peerInfo := upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
+      peerInfo :=
+        upsertRecoveredPeerInfo
+          snap.peerInfo
+          e.peer
+          snap.authSeq
+          snap.authImage
+          snap.authBlobMeta
       localInfo := recoveryCompleteLocalInfo snap e
       recovered := osdSetInsert snap.recovered e.peer
   }
@@ -2382,7 +2396,13 @@ theorem imageInvariant_recoveryCompleteRefreshedSnap
   unfold recoveryCompleteRefreshedSnap
   exact imageInvariant_refreshImageStateFromKnownPeers {
     snap with
-      peerInfo := upsertRecoveredPeerInfo snap.peerInfo e.peer snap.authSeq snap.authImage
+      peerInfo :=
+        upsertRecoveredPeerInfo
+          snap.peerInfo
+          e.peer
+          snap.authSeq
+          snap.authImage
+          snap.authBlobMeta
       localInfo := recoveryCompleteLocalInfo snap e
       recovered := osdSetInsert snap.recovered e.peer
   }
@@ -2499,13 +2519,14 @@ def allReplicasRecoveredPeerInfo
     (snap : Snapshot) (e : Event.AllReplicasRecovered) : PeerInfoMap :=
   e.peers.foldl
     (fun entries peer =>
-      upsertRecoveredPeerInfo entries peer snap.authSeq snap.authImage)
+      upsertRecoveredPeerInfo entries peer snap.authSeq snap.authImage snap.authBlobMeta)
     snap.peerInfo
 
 def allReplicasRecoveredLocalInfo (snap : Snapshot) : PGInfo :=
   {
     snap.localInfo with
       image := snap.authImage
+      blobMeta := snap.authBlobMeta
       committedSeq := snap.authSeq
       committedLength := primaryLength snap.authImage
   }
@@ -2681,7 +2702,7 @@ theorem imageInvariant_onAllReplicasRecovered
         snap e hInvariant hRecovering hActive
 
 def replicaActivateAuthInfo (e : Event.ReplicaActivate) : PeerInfo :=
-  normalizedPeerInfo e.authInfo
+  replicaActivatePeerInfo e
 
 def replicaActivateAuthSeq (e : Event.ReplicaActivate) : JournalSeq :=
   let authInfo := replicaActivateAuthInfo e
@@ -2713,6 +2734,7 @@ def replicaActivateLocalInfo (snap : Snapshot) (e : Event.ReplicaActivate) : PGI
   {
     snap.localInfo with
       image := replicaActivateLocalImage snap e
+      blobMeta := e.authBlobMeta
       committedSeq := replicaActivateLocalCommittedSeq snap e
       committedLength := primaryLength (replicaActivateLocalImage snap e)
       lastEpochStarted :=
@@ -2727,14 +2749,16 @@ def replicaActivateLocalInfo (snap : Snapshot) (e : Event.ReplicaActivate) : PGI
           snap.localInfo.lastIntervalStarted
   }
 
+def replicaActivatePeerInfoMap (snap : Snapshot) (e : Event.ReplicaActivate) : PeerInfoMap :=
+  insertPeerInfo snap.peerInfo e.sender (replicaActivatePeerInfo e)
+
 def replicaActivatePreparedSnap (snap : Snapshot) (e : Event.ReplicaActivate) : Snapshot :=
-  {
-    snap with
-      authSeq := replicaActivateAuthSeq e
-      authSources := replicaActivateAuthSources e
-      authImage := replicaActivateAuthImage e
-      localInfo := replicaActivateLocalInfo snap e
-  }
+  { refreshAuthorityFromKnownPeers {
+      snap with
+        peerInfo := replicaActivatePeerInfoMap snap e
+        localInfo := replicaActivateLocalInfo snap e
+    } with
+      authBlobMeta := e.authBlobMeta }
 
 def replicaActivateSupported (snap : Snapshot) (e : Event.ReplicaActivate) : Prop :=
   replicaActivateAuthSeq e = authoritativeCommittedSeq (knownPeerImages snap) ∧
@@ -2751,6 +2775,7 @@ theorem effectivePGImage_replicaActivateLocalInfo
   change effectivePGImage
       { snap.localInfo with
         image := image
+        blobMeta := e.authBlobMeta
         committedSeq := replicaActivateLocalCommittedSeq snap e
         committedLength := primaryLength image
         lastEpochStarted :=
@@ -2807,71 +2832,38 @@ theorem normalizedCommittedSeq_replicaActivateLocalInfo
 
 theorem replicaActivatePreparedSnap_eq_refreshAuthorityFromKnownPeers
     (snap : Snapshot) (e : Event.ReplicaActivate)
-    (hInvariant : ImageInvariant snap)
-    (hSupported : replicaActivateSupported snap e) :
+    (_hInvariant : ImageInvariant snap)
+    (_hSupported : replicaActivateSupported snap e) :
     replicaActivatePreparedSnap snap e =
-      refreshAuthorityFromKnownPeers { snap with localInfo := replicaActivateLocalInfo snap e } := by
-  rcases hSupported with ⟨hSeq, hSources, hImage, hLocalAuth⟩
-  have hSeq' :
-      authoritativeCommittedSeq (knownPeerImages { snap with localInfo := replicaActivateLocalInfo snap e }) =
-        authoritativeCommittedSeq (knownPeerImages snap) := by
-    exact authoritativeCommittedSeq_knownPeerImages_update_localInfo
-      snap
-      (replicaActivateLocalInfo snap e)
-      (normalizedCommittedSeq_replicaActivateLocalInfo snap e hInvariant hSeq)
-  have hSources' :
-      authoritativeSources (knownPeerImages { snap with localInfo := replicaActivateLocalInfo snap e }) =
-        authoritativeSources (knownPeerImages snap) := by
-    exact authoritativeSources_knownPeerImages_update_localInfo_of_authorityEq
-      snap
-      (replicaActivateLocalInfo snap e)
-      hLocalAuth
-  unfold replicaActivatePreparedSnap refreshAuthorityFromKnownPeers
-  simp [hSeq, hSources, hImage, hSeq', hSources']
+      { refreshAuthorityFromKnownPeers {
+          snap with
+            peerInfo := replicaActivatePeerInfoMap snap e
+            localInfo := replicaActivateLocalInfo snap e
+        } with
+          authBlobMeta := e.authBlobMeta } := by
+  rfl
 
 theorem localWithinAuthority_replicaActivatePreparedSnap
     (snap : Snapshot) (e : Event.ReplicaActivate)
-    (hInvariant : ImageInvariant snap)
-    (hSupported : replicaActivateSupported snap e) :
+    (_hInvariant : ImageInvariant snap)
+    (_hSupported : replicaActivateSupported snap e) :
     localWithinAuthority (replicaActivatePreparedSnap snap e) := by
-  have hInvariant' := hInvariant
-  rcases hInvariant with ⟨_hBacked, _hAuthImage, hAuthSeq, _hAuthSources,
-    hLocal, _hActing, _hPeerPlans, _hLocalPlan⟩
-  rcases hLocal with ⟨hLocalSeq, _hLocalPrefix⟩
-  rcases hSupported with ⟨hSeq, _hSources, hImage, _hLocalAuth⟩
-  have hSeq' : replicaActivateAuthSeq e = snap.authSeq := by
-    rw [hSeq, ← hAuthSeq]
-  constructor
-  · simpa [replicaActivatePreparedSnap,
-      committedSeq_replicaActivateLocalInfo snap e hInvariant' hSeq, hSeq'] using hLocalSeq
-  · intro obj
-    rw [show effectivePGImage (replicaActivatePreparedSnap snap e).localInfo =
-        replicaActivateLocalImage snap e by
-          simp [replicaActivatePreparedSnap, effectivePGImage_replicaActivateLocalInfo]]
-    rw [show (replicaActivatePreparedSnap snap e).authImage = replicaActivateAuthImage e by
-          simp [replicaActivatePreparedSnap]]
-    simpa [replicaActivateLocalImage, hImage] using
-      (prefixImage_clampImageTo_left (replicaActivateAuthImage e) (effectivePGImage snap.localInfo) obj)
+  simpa [replicaActivatePreparedSnap, localWithinAuthority] using
+    localWithinAuthority_refreshAuthorityFromKnownPeers
+      { snap with
+          peerInfo := replicaActivatePeerInfoMap snap e
+          localInfo := replicaActivateLocalInfo snap e }
 
 theorem actingReplicaWithinAuthority_replicaActivatePreparedSnap
     (snap : Snapshot) (e : Event.ReplicaActivate)
-    (hInvariant : ImageInvariant snap)
-    (hSupported : replicaActivateSupported snap e) :
+    (_hInvariant : ImageInvariant snap)
+    (_hSupported : replicaActivateSupported snap e) :
     actingReplicaWithinAuthority (replicaActivatePreparedSnap snap e) := by
-  rcases hInvariant with ⟨_hBacked, hAuthImage, hAuthSeq, _hAuthSources,
-    _hLocal, hActing, _hPeerPlans, _hLocalPlan⟩
-  rcases hSupported with ⟨hSeq, _hSources, hImage, _hLocalAuth⟩
-  have hSeq' : replicaActivateAuthSeq e = snap.authSeq := by
-    rw [hSeq, ← hAuthSeq]
-  have hAuthPrefix :
-      prefixImage snap.authImage (replicaActivateAuthImage e) := by
-    rw [hImage]
-    exact sameImage_implies_prefix _ _ hAuthImage
-  intro peer hPeer
-  rcases hActing peer hPeer with ⟨hPeerSeq, hPeerPrefix⟩
-  constructor
-  · simpa [replicaActivatePreparedSnap, hSeq'] using hPeerSeq
-  · exact prefixImage_trans _ _ _ hPeerPrefix hAuthPrefix
+  simpa [replicaActivatePreparedSnap, actingReplicaWithinAuthority] using
+    actingReplicaWithinAuthority_refreshAuthorityFromKnownPeers
+      { snap with
+          peerInfo := replicaActivatePeerInfoMap snap e
+          localInfo := replicaActivateLocalInfo snap e }
 
 theorem imageInvariant_onReplicaActivate_supported
     (snap : Snapshot) (e : Event.ReplicaActivate)
@@ -2894,13 +2886,25 @@ theorem imageInvariant_onReplicaActivate_supported
               (refreshRecoveryPlansFromCurrentAuthority (replicaActivatePreparedSnap snap e)) := by
           apply imageInvariant_refreshRecoveryPlansFromCurrentAuthority
           · rw [hPreparedEq]
-            exact authSourcesBackedByKnownPeers_refreshAuthorityFromKnownPeers _
+            simpa using authSourcesBackedByKnownPeers_refreshAuthorityFromKnownPeers
+              { snap with
+                  peerInfo := replicaActivatePeerInfoMap snap e
+                  localInfo := replicaActivateLocalInfo snap e }
           · rw [hPreparedEq]
-            exact authImageMatchesKnownPeers_refreshAuthorityFromKnownPeers _
+            simpa using authImageMatchesKnownPeers_refreshAuthorityFromKnownPeers
+              { snap with
+                  peerInfo := replicaActivatePeerInfoMap snap e
+                  localInfo := replicaActivateLocalInfo snap e }
           · rw [hPreparedEq]
-            exact authSeq_eq_authoritativeCommittedSeq_refreshAuthorityFromKnownPeers _
+            simpa using authSeq_eq_authoritativeCommittedSeq_refreshAuthorityFromKnownPeers
+              { snap with
+                  peerInfo := replicaActivatePeerInfoMap snap e
+                  localInfo := replicaActivateLocalInfo snap e }
           · rw [hPreparedEq]
-            exact authSources_eq_authoritativeSources_refreshAuthorityFromKnownPeers _
+            simpa using authSources_eq_authoritativeSources_refreshAuthorityFromKnownPeers
+              { snap with
+                  peerInfo := replicaActivatePeerInfoMap snap e
+                  localInfo := replicaActivateLocalInfo snap e }
           · exact localWithinAuthority_replicaActivatePreparedSnap snap e hInvariant hSupported
           · exact actingReplicaWithinAuthority_replicaActivatePreparedSnap snap e hInvariant hSupported
         have hResult :
@@ -2910,9 +2914,10 @@ theorem imageInvariant_onReplicaActivate_supported
                 .replicaActive
                 "activated by primary").1 := by
           simp [onReplicaActivate, hState, hActing', hSenderEpoch,
-            replicaActivatePreparedSnap, replicaActivateAuthInfo, replicaActivateAuthSeq,
-            replicaActivateAuthSources, replicaActivateAuthImage, replicaActivateAdvanceHistory,
-            replicaActivateLocalImage, replicaActivateLocalCommittedSeq, replicaActivateLocalInfo]
+            replicaActivatePreparedSnap, replicaActivatePeerInfoMap, replicaActivatePeerInfo,
+            replicaActivateAuthInfo, replicaActivateAuthSeq, replicaActivateAuthSources,
+            replicaActivateAuthImage, replicaActivateAdvanceHistory, replicaActivateLocalImage,
+            replicaActivateLocalCommittedSeq, replicaActivateLocalInfo]
         rw [hResult]
         exact imageInvariant_transitionTo
           (refreshRecoveryPlansFromCurrentAuthority (replicaActivatePreparedSnap snap e))
@@ -2944,6 +2949,7 @@ def replicaRecoveryCompleteLocalInfo
   {
     snap.localInfo with
       image := replicaRecoveryCompleteClampedImage snap e
+      blobMeta := snap.authBlobMeta
       committedSeq := replicaRecoveryCompleteRecoveredSeq snap e
       committedLength := primaryLength (replicaRecoveryCompleteClampedImage snap e)
       lastEpochStarted := e.activationEpoch
@@ -2970,6 +2976,7 @@ theorem effectivePGImage_replicaRecoveryCompleteLocalInfo
   change effectivePGImage
       { snap.localInfo with
         image := image
+        blobMeta := snap.authBlobMeta
         committedSeq := replicaRecoveryCompleteRecoveredSeq snap e
         committedLength := primaryLength image
         lastEpochStarted := e.activationEpoch

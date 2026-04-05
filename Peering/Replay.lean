@@ -64,6 +64,9 @@ def normalizeObjectImage (image : ObjectImage) : ObjectImage :=
 def normalizeAuthorityImage (auth : AuthorityImage) : AuthorityImage :=
   { auth with entries := normalizeByRepr auth.entries }
 
+def normalizeBlobMetaImage (blobMetaImage : BlobMetaImage) : BlobMetaImage :=
+  { blobMetaImage with entries := normalizeByRepr blobMetaImage.entries }
+
 def normalizeObjRecovery (item : ObjRecovery) : ObjRecovery :=
   item
 
@@ -71,10 +74,14 @@ def normalizePeerRecoveryPlan (plan : PeerRecoveryPlan) : PeerRecoveryPlan :=
   { plan with recoveries := plan.recoveries.map normalizeObjRecovery }
 
 def normalizePeerInfo (info : PeerInfo) : PeerInfo :=
-  { info with image := normalizeObjectImage info.image }
+  { info with
+    image := normalizeObjectImage info.image
+    blobMeta := normalizeBlobMetaImage info.blobMeta }
 
 def normalizePGInfoReplay (info : PGInfo) : PGInfo :=
-  { info with image := normalizeObjectImage info.image }
+  { info with
+    image := normalizeObjectImage info.image
+    blobMeta := normalizeBlobMetaImage info.blobMeta }
 
 def normalizePeerInfoMapReplay (entries : PeerInfoMap) : PeerInfoMap :=
   entries.toList.foldl
@@ -86,6 +93,7 @@ def normalizeSnapshot (snap : Snapshot) : Snapshot :=
     localInfo := normalizePGInfoReplay snap.localInfo
     authImage := normalizeObjectImage snap.authImage
     authSources := normalizeAuthorityImage snap.authSources
+    authBlobMeta := normalizeBlobMetaImage snap.authBlobMeta
     peerInfo := normalizePeerInfoMapReplay snap.peerInfo
     peersQueried := normalizeByRepr snap.peersQueried
     peersResponded := normalizeByRepr snap.peersResponded
@@ -134,6 +142,23 @@ def parseAuthorityImage (json : Json) : Except String AuthorityImage := do
     })
   pure { entries := entries }
 
+def parseBlobMeta (json : Json) : Except String BlobMeta := do
+  pure {
+    sealed := ← json.getObjValAs? Bool "sealed"
+    finalLen := ← json.getObjValAs? (Option Length) "final_len"
+  }
+
+def parseBlobMetaImage (json : Json) : Except String BlobMetaImage := do
+  let entries ← parseList json fun item => do
+    pure ((← item.getObjValAs? ObjectId "obj"), (← parseBlobMeta item))
+  pure { entries := entries }
+
+def parseBlobMetaImageFieldOrDefault
+    (json : Json) (field : String) : Except String BlobMetaImage :=
+  match json.getObjVal? field with
+  | .ok value => parseBlobMetaImage value
+  | .error _ => pure {}
+
 def parseActingSet (json : Json) : Except String ActingSet := do
   pure {
     osds := ← json.getObjValAs? (List OsdId) "osds"
@@ -146,6 +171,7 @@ def parsePeerInfo (json : Json) : Except String PeerInfo := do
     committedSeq := ← json.getObjValAs? JournalSeq "committed_seq"
     committedLength := ← json.getObjValAs? Length "committed_length"
     image := ← parseObjectImage (← json.getObjVal? "image")
+    blobMeta := ← parseBlobMetaImageFieldOrDefault json "blob_meta"
     lastEpochStarted := ← json.getObjValAs? Epoch "last_epoch_started"
     lastIntervalStarted := ← json.getObjValAs? Epoch "last_interval_started"
   }
@@ -156,6 +182,7 @@ def parsePGInfo (json : Json) : Except String PGInfo := do
     committedSeq := ← json.getObjValAs? JournalSeq "committed_seq"
     committedLength := ← json.getObjValAs? Length "committed_length"
     image := ← parseObjectImage (← json.getObjVal? "image")
+    blobMeta := ← parseBlobMetaImageFieldOrDefault json "blob_meta"
     lastEpochStarted := ← json.getObjValAs? Epoch "last_epoch_started"
     lastIntervalStarted := ← json.getObjValAs? Epoch "last_interval_started"
     lastEpochClean := ← json.getObjValAs? Epoch "last_epoch_clean"
@@ -208,6 +235,7 @@ def parseSnapshot (json : Json) : Except String Snapshot := do
     authSeq := ← json.getObjValAs? JournalSeq "auth_seq"
     authImage := ← parseObjectImage (← json.getObjVal? "auth_image")
     authSources := ← parseAuthorityImage (← json.getObjVal? "auth_sources")
+    authBlobMeta := ← parseBlobMetaImageFieldOrDefault json "auth_blob_meta"
     peerInfo := peerInfo
     peersQueried := ← json.getObjValAs? (List OsdId) "peers_queried"
     peersResponded := ← json.getObjValAs? (List OsdId) "peers_responded"
@@ -276,6 +304,7 @@ def parseEvent (json : Json) : Except String PeeringEvent := do
         sender := ← json.getObjValAs? OsdId "from"
         authInfo := ← parsePeerInfo (← json.getObjVal? "auth_info")
         authSources := ← parseAuthorityImage (← json.getObjVal? "auth_sources")
+        authBlobMeta := ← parseBlobMetaImageFieldOrDefault json "auth_blob_meta"
         authoritativeSeq := ← json.getObjValAs? JournalSeq "authoritative_seq"
         activationEpoch := ← json.getObjValAs? Epoch "activation_epoch"
       }
@@ -324,6 +353,7 @@ def parseEffect (json : Json) : Except String PeeringEffect := do
         pgid := ← json.getObjValAs? PgId "pgid"
         authInfo := ← parsePeerInfo (← json.getObjVal? "auth_info")
         authSources := ← parseAuthorityImage (← json.getObjVal? "auth_sources")
+        authBlobMeta := ← parseBlobMetaImageFieldOrDefault json "auth_blob_meta"
         authoritativeSeq := ← json.getObjValAs? JournalSeq "authoritative_seq"
         activationEpoch := ← json.getObjValAs? Epoch "activation_epoch"
       }
@@ -333,6 +363,8 @@ def parseEffect (json : Json) : Except String PeeringEffect := do
         authoritativeSeq := ← json.getObjValAs? JournalSeq "authoritative_seq"
         authoritativeLength := ← json.getObjValAs? Length "authoritative_length"
         authoritativeImage := ← parseObjectImage (← json.getObjVal? "authoritative_image")
+        authoritativeBlobMeta := ←
+          parseBlobMetaImageFieldOrDefault json "authoritative_blob_meta"
         activationEpoch := ← json.getObjValAs? Epoch "activation_epoch"
       }
   | "DeactivatePG" =>
@@ -379,6 +411,8 @@ def parseEffect (json : Json) : Except String PeeringEffect := do
         committedLength := ← json.getObjValAs? Length "committed_length"
         image := ← parseObjectImage (← json.getObjVal? "image")
         authoritativeImage := ← parseObjectImage (← json.getObjVal? "authoritative_image")
+        authoritativeBlobMeta := ←
+          parseBlobMetaImageFieldOrDefault json "authoritative_blob_meta"
         actingSize := ← json.getObjValAs? Nat "acting_size"
         upSize := ← json.getObjValAs? Nat "up_size"
       }

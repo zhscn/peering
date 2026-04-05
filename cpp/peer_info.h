@@ -5,7 +5,9 @@
  * Ceph's full PGLog machinery, but it still needs two semantic layers:
  *
  *   - a PG-scoped committed journal prefix for IO ordering
- *   - an objectwise image for recovery planning
+ *   - an objectwise readable-prefix image for recovery planning
+ *   - optional blob-level finalization metadata carried separately from
+ *     readability/publication
  *
  * This replaces the parts of Ceph's pg_info_t, pg_log_t, pg_missing_t, and
  * eversion_t that are relevant to the extracted peering state machine.
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +39,7 @@ inline constexpr object_id_t primary_object_id = 0;
 
 // ── Objectwise image summaries ────────────────────────────────────
 
+// Objectwise committed readable-prefix lengths. Missing entries mean length 0.
 using ObjectImage = std::map<object_id_t, uint64_t>;
 
 struct ObjectAuthority {
@@ -46,6 +50,15 @@ struct ObjectAuthority {
 };
 
 using AuthorityImage = std::map<object_id_t, ObjectAuthority>;
+
+struct BlobMeta {
+  bool sealed = false;
+  std::optional<uint64_t> final_len;
+
+  bool operator==(const BlobMeta &) const = default;
+};
+
+using BlobMetaImage = std::map<object_id_t, BlobMeta>;
 
 struct ObjRecovery {
   object_id_t obj = 0;
@@ -71,7 +84,7 @@ struct PeerRecoveryPlan {
 // pg_missing_t — hundreds of fields. Under append-only semantics,
 // the peering-relevant state is:
 //   - how far the peer's committed journal prefix extends
-//   - what committed object image it has materialized
+//   - what committed readable object image it has materialized
 struct PeerInfo {
   osd_id_t osd = -1;
   journal_seq_t committed_seq = 0;
@@ -80,6 +93,7 @@ struct PeerInfo {
   // This is not the ordering source of truth once committed_seq is present.
   uint64_t committed_length = 0;
   ObjectImage image;
+  BlobMetaImage blob_meta;
 
   // Last epoch this peer participated in a completed peering.
   epoch_t last_epoch_started = 0;
@@ -102,6 +116,7 @@ struct PGInfo {
   // Legacy scalar compatibility for older image-only reducers and replay.
   uint64_t committed_length = 0;
   ObjectImage image;
+  BlobMetaImage blob_meta;
 
   // Peering history (subset of pg_history_t).
   epoch_t last_epoch_started = 0;
@@ -254,6 +269,31 @@ authoritative_sources(const std::vector<PeerInfo> &infos) {
     }
   }
   return auth;
+}
+
+inline BlobMeta lookup_blob_meta(const BlobMetaImage &blob_meta,
+                                 object_id_t obj) {
+  auto it = blob_meta.find(obj);
+  return it == blob_meta.end() ? BlobMeta{} : it->second;
+}
+
+inline BlobMetaImage authoritative_blob_meta(const std::vector<PeerInfo> &infos,
+                                             const AuthorityImage &auth) {
+  BlobMetaImage meta;
+  for (const auto &[obj, authority] : auth) {
+    auto peer_it =
+        std::ranges::find_if(infos, [&](const PeerInfo &info) {
+          return info.osd == authority.authority_osd;
+        });
+    if (peer_it == infos.end()) {
+      continue;
+    }
+    auto item = lookup_blob_meta(peer_it->blob_meta, obj);
+    if (item.sealed && item.final_len == authority.authority_length) {
+      meta[obj] = std::move(item);
+    }
+  }
+  return meta;
 }
 
 inline AuthorityImage authority_from_image(osd_id_t source,

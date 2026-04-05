@@ -99,9 +99,11 @@ What it means operationally:
 For a storage engineer, the key mental model is:
 
 - `authSeq` is the authoritative committed journal prefix
-- `authImage` is the authoritative committed object image
+- `authImage` is the authoritative committed readable object image
 - `authSources` says which replica currently backs each authoritative object
   extent
+- `authBlobMeta` carries blob-level finalization metadata such as `sealed` and
+  `finalLen`; it is separate from publication/readability
 - `peerRecoveryPlans` and `localRecoveryPlan` are derived obligations needed to
   bring short replicas or the local PG up to authority
 
@@ -152,7 +154,7 @@ storage.
 Under that assumption, the semantic state of a PG can be reduced to:
 
 - a committed journal prefix
-- a committed materialized object image
+- a committed readable object image
 - an object-by-object authority/source map
 
 That is why the model can focus on authority selection and recovery-gap
@@ -167,7 +169,7 @@ The central question in peering is:
 In this model, authority is recomputed from the current known peer images:
 
 - `authSeq`: authoritative committed journal prefix
-- `authImage`: authoritative committed object image
+- `authImage`: authoritative committed readable object image
 - `authSources`: which peer currently backs each authoritative object extent
 
 Once authority is fixed, recovery work is not guessed. It is derived exactly as
@@ -183,7 +185,10 @@ The reduced snapshot keeps the pieces that matter for reducer decisions:
 - local PG progress: committed seq, committed image, peering history
 - placement inputs: `acting`, `up`, pool size, `min_size`
 - peer knowledge: `peer_info`, queried/responded peers, prior-interval peers
-- authority state: `authSeq`, `authImage`, `authSources`
+- authority state: `authSeq`, `authImage`, `authSources`, `authBlobMeta`
+  `authImage` records the readable committed prefix, while seal/finalization is
+  separate blob metadata rather than part of publication. `authBlobMeta`
+  carries blob-level `sealed` / `finalLen` finalization state when available.
 - work state: `peerRecoveryPlans`, `localRecoveryPlan`, `recoveryTargets`
 
 ### Primary-side algorithm

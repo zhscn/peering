@@ -122,6 +122,7 @@ known_peer_images(osd_id_t whoami, const PGInfo &local_info,
       .committed_seq = local.committed_seq,
       .committed_length = local.committed_length,
       .image = local.image,
+      .blob_meta = local.blob_meta,
       .last_epoch_started = local.last_epoch_started,
       .last_interval_started = local.last_interval_started,
   });
@@ -147,6 +148,7 @@ acting_replica_images(const ActingSet &acting, osd_id_t whoami,
           .committed_seq = 0,
           .committed_length = 0,
           .image = {},
+          .blob_meta = {},
           .last_epoch_started = 0,
           .last_interval_started = 0,
       });
@@ -516,6 +518,7 @@ void PeeringStateMachine::refresh_authority_from_known_peers() {
   auto known_peers = known_peer_images(whoami_, local, peers);
   auth_seq_ = authoritative_committed_seq(known_peers);
   auth_sources_ = authoritative_sources(known_peers);
+  auth_blob_meta_.clear();
   auth_image_ = authority_image_values(auth_sources_);
 }
 
@@ -1227,6 +1230,7 @@ void PeeringStateMachine::apply_activation_decision(
     auth_info.committed_seq = auth_seq_;
     auth_info.committed_length = primary_length(auth_image_);
     auth_info.image = auth_image_;
+    auth_info.blob_meta = auth_blob_meta_;
     auth_info.last_epoch_started = epoch_;
     auth_info.last_interval_started = epoch_;
 
@@ -1235,6 +1239,7 @@ void PeeringStateMachine::apply_activation_decision(
         .pgid = pgid_,
         .auth_info = auth_info,
         .auth_sources = auth_sources_,
+        .auth_blob_meta = auth_blob_meta_,
         .authoritative_seq = auth_seq_,
         .activation_epoch = epoch_,
     });
@@ -1246,6 +1251,7 @@ void PeeringStateMachine::apply_activation_decision(
       .authoritative_seq = auth_seq_,
       .authoritative_length = primary_length(auth_image_),
       .authoritative_image = auth_image_,
+      .authoritative_blob_meta = auth_blob_meta_,
       .activation_epoch = epoch_,
   });
 
@@ -1346,10 +1352,12 @@ void PeeringStateMachine::apply_recovery_progress_decision(
     info.committed_seq = auth_seq_;
     info.committed_length = primary_length(auth_image_);
     info.image = auth_image_;
+    info.blob_meta = auth_blob_meta_;
   }
 
   if (decision.update_local_to_auth) {
     local_info_.image = auth_image_;
+    local_info_.blob_meta = auth_blob_meta_;
     local_info_.committed_seq = auth_seq_;
     local_info_.committed_length = primary_length(auth_image_);
   }
@@ -1374,7 +1382,7 @@ PeeringStateMachine::decide_replica_activation(
 
   // Supported invariant assumption for replica-side handlers:
   // the primary must build `SendActivate` from one fresh authority snapshot.
-  // In particular, `e.auth_info`, `e.auth_sources`, and
+  // In particular, `e.auth_info`, `e.auth_sources`, `e.auth_blob_meta`, and
   // `e.authoritative_seq` are expected to match the primary's latest
   // `known_peer_images()`-derived authority, not cached older data.
   // The reducer keeps compatibility fallbacks for sparse messages, but the
@@ -1394,12 +1402,16 @@ PeeringStateMachine::decide_replica_activation(
     return decision;
 
   auto auth_info = normalize_peer_info_copy(e.auth_info);
+  auth_info.osd = e.from;
   decision.kind = ReplicaActivationDecisionKind::Activate;
+  decision.sender = e.from;
+  decision.auth_peer_info = auth_info;
   decision.auth_seq =
       e.authoritative_seq > 0 ? e.authoritative_seq : auth_info.committed_seq;
   decision.auth_sources = !e.auth_sources.empty()
                               ? e.auth_sources
                               : authority_from_peer_info(auth_info);
+  decision.auth_blob_meta = e.auth_blob_meta;
   decision.auth_image = !decision.auth_sources.empty()
                             ? authority_image_values(decision.auth_sources)
                             : auth_info.image;
@@ -1419,10 +1431,13 @@ void PeeringStateMachine::apply_replica_activation_decision(
   auth_seq_ = decision.auth_seq;
   auth_image_ = decision.auth_image;
   auth_sources_ = decision.auth_sources;
+  auth_blob_meta_ = decision.auth_blob_meta;
+  peer_info_[decision.sender] = decision.auth_peer_info;
 
   // Fix (round 1+8): Advance LES only for a fully caught-up replica and
   // clamp any overlong local tail to the chosen authority.
   local_info_.image = clamp_image_to(auth_image_, effective_image(local_info_));
+  local_info_.blob_meta = auth_blob_meta_;
   if (local_info_.committed_seq > auth_seq_) {
     local_info_.committed_seq = auth_seq_;
   }
@@ -1432,6 +1447,8 @@ void PeeringStateMachine::apply_replica_activation_decision(
     local_info_.last_epoch_started = decision.activation_epoch;
     local_info_.last_interval_started = decision.activation_epoch;
   }
+  refresh_authority_from_known_peers();
+  auth_blob_meta_ = decision.auth_blob_meta;
   refresh_recovery_plans_from_current_authority();
 
   transition_to(State::ReplicaActive, "activated by primary", fx);
@@ -1491,6 +1508,7 @@ void PeeringStateMachine::apply_replica_recovery_decision(
   }
 
   local_info_.image = decision.recovered_image;
+  local_info_.blob_meta = auth_blob_meta_;
   local_info_.committed_seq = decision.committed_seq;
   local_info_.committed_length = primary_length(decision.recovered_image);
   local_info_.last_epoch_started = decision.activation_epoch;
@@ -1517,6 +1535,7 @@ void PeeringStateMachine::publish_stats(Effects &fx) {
       .committed_length = primary_length(effective_image(local_info_)),
       .image = effective_image(local_info_),
       .authoritative_image = auth_image_,
+      .authoritative_blob_meta = auth_blob_meta_,
       .acting_size = acting_.size(),
       .up_size = up_.size(),
   });
@@ -1531,6 +1550,7 @@ void PeeringStateMachine::reset_peering_state() {
   auth_seq_ = 0;
   auth_image_.clear();
   auth_sources_.clear();
+  auth_blob_meta_.clear();
   peer_recovery_plans_.clear();
   local_recovery_plan_.clear();
   recovered_.clear();
@@ -1546,6 +1566,7 @@ PeeringStateMachine::Snapshot PeeringStateMachine::snapshot() const {
   auto peer_info = normalize_peer_info_map(peer_info_);
   auto auth_image = auth_image_;
   auto auth_sources = auth_sources_;
+  auto auth_blob_meta = auth_blob_meta_;
   auto peer_recovery_plans = peer_recovery_plans_;
   auto local_recovery_plan = local_recovery_plan_;
   std::set<osd_id_t> recovery_targets =
@@ -1574,6 +1595,7 @@ PeeringStateMachine::Snapshot PeeringStateMachine::snapshot() const {
       .auth_osd = authority_osd_for(auth_sources, primary_object_id),
       .auth_image = auth_image,
       .auth_sources = auth_sources,
+      .auth_blob_meta = auth_blob_meta,
       .peer_info = peer_info,
       .peers_queried = peers_queried_,
       .peers_responded = peers_responded_,
@@ -1612,6 +1634,7 @@ PeeringStateMachine PeeringStateMachine::from_snapshot(const Snapshot &s) {
   sm.auth_sources_ = !s.auth_sources.empty()
                          ? s.auth_sources
                          : authority_from_image(s.auth_osd, sm.auth_image_);
+  sm.auth_blob_meta_ = s.auth_blob_meta;
   sm.peer_info_ = normalize_peer_info_map(s.peer_info);
   if (sm.auth_seq_ == 0) {
     sm.auth_seq_ = authoritative_committed_seq(

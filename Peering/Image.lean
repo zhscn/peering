@@ -22,6 +22,16 @@ def support (image : AuthorityImage) : List ObjectId :=
 
 end AuthorityImage
 
+namespace BlobMetaImage
+
+def keys (image : BlobMetaImage) : List ObjectId :=
+  image.entries.map Prod.fst
+
+def support (image : BlobMetaImage) : List ObjectId :=
+  image.keys.eraseDups
+
+end BlobMetaImage
+
 def singletonImage (obj : ObjectId) (len : Length) : ObjectImage :=
   if len = 0 then {} else { entries := [(obj, len)] }
 
@@ -78,6 +88,11 @@ def prefixImage (lhs rhs : ObjectImage) : Prop :=
 def sameImage (lhs rhs : ObjectImage) : Prop :=
   prefixImage lhs rhs ∧ prefixImage rhs lhs
 
+/-- Append `delta` bytes to one object's committed readable prefix. -/
+def appendReadablePrefix (image : ObjectImage) (obj : ObjectId) (delta : Length) :
+    ObjectImage :=
+  joinImage image (singletonImage obj (lookupLength image obj + delta))
+
 def clampImageTo (auth image : ObjectImage) : ObjectImage :=
   let entries :=
     (ObjectImage.support image).filterMap fun obj =>
@@ -113,6 +128,33 @@ def lookupAuthorityEntries (obj : ObjectId) :
 
 def lookupAuthority (auth : AuthorityImage) (obj : ObjectId) : ObjectAuthority :=
   lookupAuthorityEntries obj auth.entries
+
+def lookupBlobMetaEntries (obj : ObjectId) :
+    List (ObjectId × BlobMeta) → BlobMeta
+  | [] => {}
+  | (obj', blobMeta) :: rest =>
+      if obj' = obj then
+        blobMeta
+      else
+        lookupBlobMetaEntries obj rest
+
+def lookupBlobMeta (blobMeta : BlobMetaImage) (obj : ObjectId) : BlobMeta :=
+  lookupBlobMetaEntries obj blobMeta.entries
+
+def authoritativeBlobMeta (infos : List PeerInfo) (auth : AuthorityImage) :
+    BlobMetaImage :=
+  let entries :=
+    (AuthorityImage.support auth).filterMap fun obj =>
+      let authority := lookupAuthority auth obj
+      match infos.find? (fun info => info.osd = authority.authorityOsd) with
+      | none => none
+      | some info =>
+          let blobMeta := lookupBlobMeta info.blobMeta obj
+          if blobMeta.sealed && blobMeta.finalLen = some authority.authorityLength then
+            some (obj, blobMeta)
+          else
+            none
+  { entries := entries }
 
 def imageRecoveryGapsFromAuthority (localImage : ObjectImage)
     (auth : AuthorityImage) : List ObjRecovery :=
@@ -229,6 +271,50 @@ theorem prefixImage_right_join (lhs rhs : ObjectImage) :
   intro obj
   rw [lookupLength_joinImage]
   exact Nat.le_max_right _ _
+
+theorem lookupLength_singletonImage_same (obj : ObjectId) (len : Length) :
+    lookupLength (singletonImage obj len) obj = len := by
+  by_cases hZero : len = 0
+  · simp [singletonImage, hZero, lookupLength, lookupLengthEntries]
+  · simp [singletonImage, hZero, lookupLength, lookupLengthEntries]
+
+theorem lookupLength_singletonImage_of_ne
+    (obj obj' : ObjectId) (len : Length) (hNe : obj' ≠ obj) :
+    lookupLength (singletonImage obj len) obj' = 0 := by
+  by_cases hZero : len = 0
+  · simp [singletonImage, hZero, lookupLength, lookupLengthEntries]
+  · have hNe' : obj ≠ obj' := by
+      intro hEq
+      exact hNe hEq.symm
+    simp [singletonImage, hZero, lookupLength, lookupLengthEntries, hNe']
+
+theorem lookupLength_appendReadablePrefix
+    (image : ObjectImage) (obj : ObjectId) (delta : Length) :
+    lookupLength (appendReadablePrefix image obj delta) obj =
+      lookupLength image obj + delta := by
+  rw [appendReadablePrefix, lookupLength_joinImage]
+  rw [lookupLength_singletonImage_same]
+  exact Nat.max_eq_right (Nat.le_add_right _ _)
+
+theorem lookupLength_appendReadablePrefix_of_ne
+    (image : ObjectImage) (obj obj' : ObjectId) (delta : Length)
+    (hNe : obj' ≠ obj) :
+    lookupLength (appendReadablePrefix image obj delta) obj' =
+      lookupLength image obj' := by
+  rw [appendReadablePrefix, lookupLength_joinImage]
+  rw [lookupLength_singletonImage_of_ne obj obj' (lookupLength image obj + delta) hNe]
+  exact Nat.max_eq_left (Nat.zero_le _)
+
+theorem prefixImage_appendReadablePrefix
+    (image : ObjectImage) (obj : ObjectId) (delta : Length) :
+    prefixImage image (appendReadablePrefix image obj delta) := by
+  intro obj'
+  by_cases hEq : obj' = obj
+  · subst hEq
+    rw [lookupLength_appendReadablePrefix]
+    exact Nat.le_add_right _ _
+  · rw [lookupLength_appendReadablePrefix_of_ne image obj obj' delta hEq]
+    exact Nat.le_refl _
 
 theorem sameImage_implies_prefix (lhs rhs : ObjectImage) :
     sameImage lhs rhs → prefixImage lhs rhs := by

@@ -102,7 +102,7 @@ struct Initialize {
   std::vector<osd_id_t> prior_osds;
 };
 
-// Response from a peer with its visible object image.
+// Response from a peer with its committed readable object image.
 // Replaces Ceph's MNotifyRec + MLogRec combined.
 struct PeerInfoReceived {
   osd_id_t from;
@@ -143,6 +143,7 @@ struct ReplicaActivate {
   osd_id_t from;      // sender OSD (must be acting primary)
   PeerInfo auth_info; // authoritative peer image from primary
   AuthorityImage auth_sources;
+  BlobMetaImage auth_blob_meta;
   journal_seq_t authoritative_seq = 0;
   epoch_t activation_epoch;
 };
@@ -205,9 +206,9 @@ struct SendNotify {
 
 // Activate a replica. Replaces the MOSDPGLog activation message.
 // Contract for senders/runtime:
-// - `auth_info`, `auth_sources`, and `authoritative_seq` must come from one
-//   fresh authority computation on the primary. Do not mix cached fields from
-//   different snapshots.
+// - `auth_info`, `auth_sources`, `auth_blob_meta`, and `authoritative_seq`
+//   must come from one fresh authority computation on the primary. Do not mix
+//   cached fields from different snapshots.
 // - Lean's replica-side invariant proofs assume this message is internally
 //   consistent with the primary's latest `known_peer_images()` view.
 // - The reducer has fallback decoding paths for compatibility, but production
@@ -217,6 +218,7 @@ struct SendActivate {
   pg_id_t pgid;
   PeerInfo auth_info;
   AuthorityImage auth_sources;
+  BlobMetaImage auth_blob_meta;
   journal_seq_t authoritative_seq;
   epoch_t activation_epoch;
 };
@@ -230,6 +232,7 @@ struct ActivatePG {
   journal_seq_t authoritative_seq;
   uint64_t authoritative_length; // legacy scalar compatibility summary
   ObjectImage authoritative_image;
+  BlobMetaImage authoritative_blob_meta;
   epoch_t activation_epoch;
 };
 
@@ -310,6 +313,7 @@ struct PublishStats {
   uint64_t committed_length;
   ObjectImage image;
   ObjectImage authoritative_image;
+  BlobMetaImage authoritative_blob_meta;
   int acting_size;
   int up_size;
 };

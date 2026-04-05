@@ -93,6 +93,7 @@ public:
     osd_id_t auth_osd;
     ObjectImage auth_image;
     AuthorityImage auth_sources;
+    BlobMetaImage auth_blob_meta;
     std::map<osd_id_t, PeerInfo> peer_info;
     std::set<osd_id_t> peers_queried;
     std::set<osd_id_t> peers_responded;
@@ -159,6 +160,7 @@ private:
   journal_seq_t auth_seq_ = 0;
   ObjectImage auth_image_;
   AuthorityImage auth_sources_;
+  BlobMetaImage auth_blob_meta_;
   std::vector<PeerRecoveryPlan> peer_recovery_plans_;
   std::vector<ObjRecovery> local_recovery_plan_;
   std::set<osd_id_t> recovered_;
@@ -471,9 +473,12 @@ private:
 
   struct ReplicaActivationDecision {
     ReplicaActivationDecisionKind kind = ReplicaActivationDecisionKind::None;
+    osd_id_t sender = -1;
+    PeerInfo auth_peer_info;
     journal_seq_t auth_seq = 0;
     ObjectImage auth_image;
     AuthorityImage auth_sources;
+    BlobMetaImage auth_blob_meta;
     epoch_t activation_epoch = 0;
     bool advance_history = false;
   };
@@ -487,8 +492,8 @@ private:
   // Otherwise it is ignored.
   //
   // Proof-side support assumption: `auth_info` / `auth_sources` /
-  // `authoritative_seq` come from one fresh primary-side authority
-  // computation, not a stale cached activation message.
+  // `auth_blob_meta` / `authoritative_seq` come from one fresh primary-side
+  // authority computation, not a stale cached activation message.
   ReplicaActivationDecision
   decide_replica_activation(const event::ReplicaActivate &e) const;
   void

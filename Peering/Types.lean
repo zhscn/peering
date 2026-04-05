@@ -26,17 +26,34 @@ inductive State
   | deleting
   deriving DecidableEq, Repr
 
+/-- Objectwise committed readable-prefix lengths.
+Missing entries mean readable length `0`. -/
 structure ObjectImage where
   entries : List (ObjectId × Length) := []
   deriving DecidableEq, Repr
 
+/-- Authority for one object's committed readable prefix. -/
 structure ObjectAuthority where
   authorityOsd : OsdId := -1
   authorityLength : Length := 0
   deriving DecidableEq, Repr
 
+/-- Objectwise authority map for committed readable prefixes. -/
 structure AuthorityImage where
   entries : List (ObjectId × ObjectAuthority) := []
+  deriving DecidableEq, Repr
+
+/-- Blob-level finalization metadata.
+Visibility is carried by readable-prefix images; sealing only records whether
+future growth is forbidden and, when known, the terminal length. -/
+structure BlobMeta where
+  sealed : Bool := false
+  finalLen : Option Length := none
+  deriving DecidableEq, Repr
+
+/-- Objectwise finalization metadata keyed by blob/object id. -/
+structure BlobMetaImage where
+  entries : List (ObjectId × BlobMeta) := []
   deriving DecidableEq, Repr
 
 structure ObjRecovery where
@@ -58,6 +75,7 @@ structure PeerInfo where
   committedSeq : JournalSeq := 0
   committedLength : Length := 0
   image : ObjectImage := {}
+  blobMeta : BlobMetaImage := {}
   lastEpochStarted : Epoch := 0
   lastIntervalStarted : Epoch := 0
   deriving DecidableEq, Repr
@@ -67,6 +85,7 @@ structure PGInfo where
   committedSeq : JournalSeq := 0
   committedLength : Length := 0
   image : ObjectImage := {}
+  blobMeta : BlobMetaImage := {}
   lastEpochStarted : Epoch := 0
   lastIntervalStarted : Epoch := 0
   lastEpochClean : Epoch := 0
@@ -148,6 +167,7 @@ structure ReplicaActivate where
   sender : OsdId
   authInfo : PeerInfo
   authSources : AuthorityImage := {}
+  authBlobMeta : BlobMetaImage := {}
   authoritativeSeq : JournalSeq := 0
   activationEpoch : Epoch
   deriving DecidableEq, Repr
@@ -202,6 +222,7 @@ structure SendActivate where
   pgid : PgId
   authInfo : PeerInfo
   authSources : AuthorityImage := {}
+  authBlobMeta : BlobMetaImage := {}
   authoritativeSeq : JournalSeq := 0
   activationEpoch : Epoch
   deriving DecidableEq, Repr
@@ -211,6 +232,7 @@ structure ActivatePG where
   authoritativeSeq : JournalSeq := 0
   authoritativeLength : Length
   authoritativeImage : ObjectImage
+  authoritativeBlobMeta : BlobMetaImage := {}
   activationEpoch : Epoch
   deriving DecidableEq, Repr
 
@@ -261,6 +283,7 @@ structure PublishStats where
   committedLength : Length
   image : ObjectImage
   authoritativeImage : ObjectImage
+  authoritativeBlobMeta : BlobMetaImage := {}
   actingSize : Nat
   upSize : Nat
   deriving DecidableEq, Repr
